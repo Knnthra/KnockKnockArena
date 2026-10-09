@@ -1,0 +1,19 @@
+{
+    "name": "KnockKnockArena.Gameplay.Editor",
+    "rootNamespace": "KnockKnockArena.Gameplay.Editor",
+    "references": [
+        "KnockKnockArena.Gameplay",
+        "KnockKnockArena.Shared"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}
