@@ -3,7 +3,7 @@ namespace KnockKnockArena.Shared.Protocol.Messages
     public sealed class PlayerJoined
     {
         public byte PlayerId;
-        private string Username = "";
+        public string Username = "";
 
         public byte[] ToPayload()
         {

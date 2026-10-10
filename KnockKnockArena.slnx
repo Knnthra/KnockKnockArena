@@ -1,4 +1,11 @@
 <Solution>
+  <Folder Name="/KnockKnockClient/">
+    <Project Path="KnockKnockClient/Assembly-CSharp-Editor.csproj" />
+    <Project Path="KnockKnockClient/Assembly-CSharp.csproj" />
+    <Project Path="KnockKnockClient/KnockKnockArena.Gameplay.csproj" />
+    <Project Path="KnockKnockClient/KnockKnockArena.Gameplay.Editor.csproj" />
+    <Project Path="KnockKnockClient/KnockKnockArena.Shared.csproj" />
+  </Folder>
   <Folder Name="/src/">
     <Project Path="src/KnockKnockArena.Demo.M01Bits/KnockKnockArena.Demo.M01Bits.csproj" />
     <Project Path="src/KnockKnockArena.Demo.M02Serialization/KnockKnockArena.Demo.M02Serialization.csproj" />
