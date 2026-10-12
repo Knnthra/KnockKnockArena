@@ -19,37 +19,37 @@ namespace KnockKnockArena.Server.Auth
     
     public sealed class SessionManager
     {
-        private readonly object gate = new();
-        private readonly Dictionary<byte, PlayerSession> sessionsById = new();
+        private readonly object _gate = new();
+        private readonly Dictionary<byte, PlayerSession> _sessionsById = new();
         
-        private readonly int maxPlayers;
+        private readonly int _maxPlayers;
         
         public int Count
         {
-            get{lock(gate) return sessionsById.Count;}
+            get{lock(_gate) return _sessionsById.Count;}
         }
         
         public SessionManager(int maxPlayers)
         {
-            this.maxPlayers = maxPlayers;
+            _maxPlayers = maxPlayers;
         }
         
         public bool TryCreate(string username, out PlayerSession? session, out string error)
         {
-            lock(gate)
+            lock(_gate)
             {
-                if(sessionsById.Values.Any(s => s.Username.Equals(username, StringComparison.OrdinalIgnoreCase)))
+                if(_sessionsById.Values.Any(s => s.Username.Equals(username, StringComparison.OrdinalIgnoreCase)))
                 {
                     session = null;
                     error = "already logged in";
                     return false;
                 }
-                for (byte id = 1; id < maxPlayers; id++)
+                for (byte id = 1; id < _maxPlayers; id++)
                 {
-                    if(!sessionsById.ContainsKey(id))
+                    if(!_sessionsById.ContainsKey(id))
                     {
                         session = new PlayerSession(id, username, Guid.NewGuid().ToByteArray());
-                        sessionsById[id] = session;
+                        _sessionsById[id] = session;
                         error ="";
                         return true;
                     }
@@ -62,14 +62,32 @@ namespace KnockKnockArena.Server.Auth
         
         public void Remove(byte playerId)
         {
-            lock(gate)
-                sessionsById.Remove(playerId);
+            lock(_gate)
+                _sessionsById.Remove(playerId);
         }
         
         public List<PlayerSession> GetAll()
         {
-            lock(gate)
-                return new List<PlayerSession>(sessionsById.Values);
+            lock(_gate)
+                return new List<PlayerSession>(_sessionsById.Values);
+        }
+        
+        public bool TryGetByToken(byte[] token, out PlayerSession? session)
+        {
+            lock(_gate)
+            {
+                foreach (PlayerSession candidate in _sessionsById.Values)
+                {
+                    if(candidate.Token.AsSpan().SequenceEqual(token))
+                    {
+                        session = candidate;
+                        return true;
+                    }
+                }
+            }
+            
+            session = null;
+            return false;
         }
     }
     

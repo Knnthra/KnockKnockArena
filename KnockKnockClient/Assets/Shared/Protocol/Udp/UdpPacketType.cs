@@ -2,6 +2,15 @@ using System;
 
 namespace KnockKnockArena.Shared.Protocol.Udp
 {
+    public enum UdpPacketType : byte
+    {
+        Join = 0,
+        Heartbeat = 2,
+        DiscoveryRequest = 3,
+        
+        DiscoveryResponse = 102,
+    }
+    
     [Flags]
     public enum MovementBits : byte
     {

@@ -13,27 +13,28 @@ namespace KnockKnockArena.Server.Net
     {
         public const string ServerVersion = "0.6.0";
 
-        private readonly ServerConfig config;
-        private readonly SessionManager sessions;
-        private readonly List<ClientConnection> clients = new();
-        private readonly object clientGate = new();
-        private readonly DateTime startUtc = DateTime.UtcNow;
-        private TcpListener? listner;
+        private readonly ServerConfig _config;
+        private readonly SessionManager _sessions;
+        private readonly List<ClientConnection> _clients = new();
+        private readonly object _clientsGate = new();
+        private readonly DateTime _startUtc = DateTime.UtcNow;
+        private TcpListener? _listener;
+        public event Action<PlayerSession>? PlayerDisconnected;
 
-        public TimeSpan Uptime => DateTime.UtcNow - startUtc;
-        public int PlayersOnline => sessions.Count;
+        public TimeSpan Uptime => DateTime.UtcNow - _startUtc;
+        public int PlayersOnline => _sessions.Count;
 
         public TcpGameServer(ServerConfig config, SessionManager sessions)
         {
-            this.config = config;
-            this.sessions = sessions;
+            _config = config;
+            _sessions = sessions;
         }
 
         private void Broadcast(MessageType type, byte[] payload, ClientConnection? except = null)
         {
             ClientConnection[] snapshot;
-            lock (clientGate)
-                snapshot = clients.ToArray();
+            lock (_clientsGate)
+                snapshot = _clients.ToArray();
 
             foreach (ClientConnection client in snapshot)
             {
@@ -54,9 +55,9 @@ namespace KnockKnockArena.Server.Net
 
         private void Disconnect(ClientConnection connection, string reason)
         {
-            lock (clientGate)
+            lock (_clientsGate)
             {
-                if (!clients.Remove(connection))
+                if (!_clients.Remove(connection))
                     return;
             }
 
@@ -66,20 +67,43 @@ namespace KnockKnockArena.Server.Net
 
             if (session != null)
             {
-                sessions.Remove(session.PlayerId);
+                _sessions.Remove(session.PlayerId);
+                PlayerDisconnected?.Invoke(session);
                 Broadcast(MessageType.PlayerLeft, new PlayerLeft
                 {
                     PlayerId = session.PlayerId,
                     Username = session.Username,
                 }.ToPayload());
                 Log.Info($"Player left: {session.Username}#{session.PlayerId} ({reason}) " +
-         $"({sessions.Count}/{config.MaxPlayers} online)");
+         $"({_sessions.Count}/{_config.MaxPlayers} online)");
             }
             else
             {
                 Log.Info($"Connection closed: {connection.RemoteEndPoint} ({reason})");
             }
         }
+        
+        public void KickByPlayerId(byte playerId, string reason)
+        {
+            ClientConnection? target = null;
+            lock (_clientsGate)
+            {
+                foreach (ClientConnection client in _clients)
+                {
+                    if (client.Session?.PlayerId == playerId)
+                    {
+                        target = client;
+                        break;
+                    }
+                }
+            }
+            if (target != null)
+            {
+                Log.Info($"Kicking {target.DisplayName}: {reason}");
+                Disconnect(target, reason);
+            }
+        }
+        
 
         private void HandleLogin(ClientConnection connection, byte[] payload)
         {
@@ -109,7 +133,7 @@ namespace KnockKnockArena.Server.Net
             {
                 error = "invalid credentials";
             }
-            else if (sessions.TryCreate(request.Username, out PlayerSession? session, out error))
+            else if (_sessions.TryCreate(request.Username, out PlayerSession? session, out error))
             {
                 connection.Session = session;
                 connection.Send(MessageType.LoginResponse, new LoginResponse
@@ -123,8 +147,8 @@ namespace KnockKnockArena.Server.Net
                 {
                     ServerVersion = ServerVersion,
                     TickRate = GameConstants.TickRate,
-                    MaxPlayers = (byte)config.MaxPlayers,
-                    PlayersOnline = (byte)sessions.Count,
+                    MaxPlayers = (byte)_config.MaxPlayers,
+                    PlayersOnline = (byte)_sessions.Count,
                     MapName = "",
                     MapHash = 0,
                 }.ToPayload());
@@ -135,7 +159,7 @@ namespace KnockKnockArena.Server.Net
                     Username = session.Username,
                 }.ToPayload(), except: connection);
 
-                foreach (PlayerSession exsiting in sessions.GetAll())
+                foreach (PlayerSession exsiting in _sessions.GetAll())
                 {
                     if (exsiting.PlayerId == session.PlayerId)
                         continue;
@@ -147,7 +171,7 @@ namespace KnockKnockArena.Server.Net
                     }.ToPayload());
 
                 }
-                Log.Info($"Login OK: {connection.DisplayName} ({sessions.Count}/{config.MaxPlayers} online)");
+                Log.Info($"Login OK: {connection.DisplayName} ({_sessions.Count}/{_config.MaxPlayers} online)");
 
                 return;
 
@@ -170,7 +194,7 @@ namespace KnockKnockArena.Server.Net
                     HandleLogin(connection, payload);
                     break;
                 case MessageType.ChatSend:
-                    HandleChat(connection,payload);
+                    HandleChat(connection, payload);
                     break;
                 default:
                     throw new ProtocolException($"unknown type {(byte)type}");
@@ -215,11 +239,11 @@ namespace KnockKnockArena.Server.Net
         {
             while (true)
             {
-                TcpClient tcpClient = listner!.AcceptTcpClient();
+                TcpClient tcpClient = _listener!.AcceptTcpClient();
                 ClientConnection connection = new(tcpClient);
 
-                lock (clientGate)
-                    clients.Add(connection);
+                lock (_clientsGate)
+                    _clients.Add(connection);
 
                 Log.Info($"Connection from {connection.RemoteEndPoint}");
 
@@ -243,7 +267,7 @@ namespace KnockKnockArena.Server.Net
                 throw new ProtocolException("empty chat message");
 
             Log.Info($"Chat {connection.Session.Username}: {chat.Text}");
-            
+
             Broadcast(MessageType.ChatBroadcast, new ChatBroadcast
             {
                 PlayerId = connection.Session.PlayerId,
@@ -254,9 +278,9 @@ namespace KnockKnockArena.Server.Net
 
         public void Start()
         {
-            listner = new TcpListener(IPAddress.Any, config.Port);
-            listner.Start();
-            Log.Info($"TCP listening on port {config.Port}");
+            _listener = new TcpListener(IPAddress.Any, _config.Port);
+            _listener.Start();
+            Log.Info($"TCP listening on port {_config.Port}");
 
             Thread acceptThread = new(AcceptLoop) { IsBackground = true, Name = "tcp-accept" };
             acceptThread.Start();

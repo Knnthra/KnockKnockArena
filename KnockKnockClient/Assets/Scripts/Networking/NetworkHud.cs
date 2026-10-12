@@ -4,11 +4,13 @@ using UnityEngine;
 namespace KnockKnockArena.Networking
 {
     /// <summary>
-    /// Handed out (Moodle), module 4: the dev UI — connect panel, HUD, chat and the
-    /// joined/left feed. It only reads NetworkBootstrap's public properties, listens to
-    /// its two events and calls its public methods; it never touches the network.
-    /// Put it in Assets/Scripts/Networking next to NetworkBootstrap. It adds itself to
-    /// the NetworkBootstrap object when the scene starts, so nothing in the scene changes.
+    /// Handed out (Moodle), module 5 after implementation 4: the dev UI — connect panel,
+    /// HUD with the UDP join and heartbeat counters, chat and the joined/left feed. It
+    /// replaces module 4's NetworkHud.cs. It only reads NetworkBootstrap's public
+    /// properties, listens to its two events and calls its public methods; it never
+    /// touches the network. Put it in Assets/Scripts/Networking next to NetworkBootstrap.
+    /// It adds itself to the NetworkBootstrap object when the scene starts, so nothing in
+    /// the scene changes.
     /// </summary>
     public sealed class NetworkHud : MonoBehaviour
     {
@@ -135,8 +137,9 @@ namespace KnockKnockArena.Networking
 
         private void DrawHud()
         {
-            GUILayout.BeginArea(new Rect(20, 20, 780, 80));
-            GUILayout.Label(_net.StatusLine);
+            GUILayout.BeginArea(new Rect(20, 20, 780, 100));
+            GUILayout.Label(_net.InGame ? "In the game (UDP)" : _net.StatusLine);
+            GUILayout.Label($"UDP: joins sent={_net.JoinsSent}  heartbeats={_net.HeartbeatsSent}");
             GUILayout.Label($"{_net.ServerInfoLine}  |  unknown TCP messages skipped: {_net.TcpMessagesSkipped}");
             GUILayout.Label("Enter chat");
             GUILayout.EndArea();

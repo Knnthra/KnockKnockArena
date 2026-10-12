@@ -6,9 +6,9 @@ namespace KnockKnockArena.Server.Net
 {
     public sealed class ClientConnection
     {
-        private readonly TcpClient tcpClient;
-        private readonly NetworkStream stream;
-        private readonly object sendGate = new();
+        private readonly TcpClient _tcpClient;
+        private readonly NetworkStream _stream;
+        private readonly object _sendGate = new();
         public PlayerSession? Session;
         public string RemoteEndPoint { get; }
         
@@ -18,25 +18,25 @@ namespace KnockKnockArena.Server.Net
         
         public ClientConnection(TcpClient tcpClient)
         {
-            this.tcpClient = tcpClient;
-            stream = tcpClient.GetStream();
-            RemoteEndPoint = tcpClient.Client.RemoteEndPoint?.ToString() ?? "unknown";
+            _tcpClient = tcpClient;
+            _stream = _tcpClient.GetStream();
+            RemoteEndPoint = _tcpClient.Client.RemoteEndPoint?.ToString() ?? "unknown";
         }
         
         public bool TryReadMessage(out MessageType type, out byte[] payload)
         {
-            return TcpFraming.TryReadMessage(stream,out type, out payload);
+            return TcpFraming.TryReadMessage(_stream,out type, out payload);
         }
         
         public void Send(MessageType type, byte[] payload)
         {
-            lock(sendGate)
-                TcpFraming.WriteMessage(stream,type,payload);
+            lock(_sendGate)
+                TcpFraming.WriteMessage(_stream,type,payload);
         }
         
         public void Close()
         {
-            try{tcpClient.Close();}
+            try{_tcpClient.Close();}
             catch
             {
                 //Already closed

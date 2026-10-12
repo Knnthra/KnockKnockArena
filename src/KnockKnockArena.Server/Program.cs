@@ -3,6 +3,8 @@ using KnockKnockArena.Server;
 using KnockKnockArena.Server.Auth;
 using KnockKnockArena.Server.Net;
 using KnockKnockArena.Shared.Protocol;
+using KnockKnockArena.Server.Game;
+
 
 CultureInfo.DefaultThreadCurrentCulture = CultureInfo.InvariantCulture;
 CultureInfo.CurrentCulture = CultureInfo.InvariantCulture;
@@ -21,11 +23,21 @@ catch (ArgumentException ex)
 
 Log.VerboseEnabled = config.Verbose;
 Log.Info($"KnockKnock Arena server v{TcpGameServer.ServerVersion} (protocol v{ProtocolConstants.Version})");
-Log.Info($"port={config.Port} maxPlayers={config.MaxPlayers} verbose={(config.Verbose ? "on" : "off")}");
+Log.Info($"name=\"{config.ServerName}\" port={config.Port} maxPlayers={config.MaxPlayers} " +
+         $"verbose={(config.Verbose ? "on" : "off")}");
 
 SessionManager sessions = new(config.MaxPlayers);
+GameWorld world = new();
 TcpGameServer server = new(config, sessions);
+UdpGameServer udpServer = new(config, sessions, world);
+server.PlayerDisconnected += session =>
+{
+    if (world.TryDespawn(session.PlayerId))
+        Log.Info($"Despawned {session.Username}#{session.PlayerId} from game world");
+};
+udpServer.KickPlayer = server.KickByPlayerId;
 server.Start();
+udpServer.Start();
 
 using ManualResetEventSlim shutdown = new();
 
@@ -41,8 +53,9 @@ while (!shutdown.IsSet)
     {
         case "status":
             Log.Info($"version={TcpGameServer.ServerVersion} " +
-         $"uptime={server.Uptime:hh\\:mm\\:ss} " +
-         $"players={server.PlayersOnline}/{config.MaxPlayers}");
+                     $"uptime={server.Uptime:hh\\:mm\\:ss} " +
+                     $"players={server.PlayersOnline}/{config.MaxPlayers} " +
+                     $"inGame={world.PlayerCount} tick={world.ServerTick}");
             break;
         case "quit":
             shutdown.Set();
