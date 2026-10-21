@@ -14,9 +14,10 @@ namespace KnockKnockArena.Networking
     /// student base project is produced by deleting the Networking folder and this
     /// object from the scene.
     ///
-    /// MODULE 6, LOCKSTEP: inputs are sampled at the tick rate and sent, and every
-    /// player — you included — is drawn where the newest snapshot says. Nothing moves
-    /// until the server has answered: you feel the whole round trip. The dev UI is
+    /// MODULE 6: movement. Inputs are sampled at the tick rate and sent; the local
+    /// player is predicted with the SHARED MovementSimulation the instant an input is
+    /// sampled and reconciled bit for bit against every snapshot. Other players are
+    /// drawn at their snapshot position (interpolation comes in M07). The dev UI is
     /// NetworkHud (handed out): it only reads the public properties below, listens to
     /// the two events and calls the public methods. Nothing here draws anything.
     /// </summary>
@@ -32,6 +33,14 @@ namespace KnockKnockArena.Networking
         [Tooltip("Delay on all UDP traffic, each way, in ms. 2x this = simulated round trip.")]
         public int SimulatedLatencyMs = 0;
 
+        [Tooltip("Simulate your own movement immediately instead of waiting for the server.")]
+        public bool EnablePrediction = true;
+
+        [Tooltip("Replay unacknowledged inputs on top of each snapshot. Off = snap " +
+                 "straight to the server's position: you trail a round trip behind " +
+                 "and hop back about 0.2 m - it feels like lockstep.")]
+        public bool EnableReconciliation = true;
+
         [Header("Gameplay couplings")]
         public CursorAim AimSource;
 
@@ -43,6 +52,9 @@ namespace KnockKnockArena.Networking
                  "null on disconnect. Wire your camera's SetTarget(Transform) here.")]
         public UnityEngine.Events.UnityEvent<Transform> LocalPlayerSpawned =
             new UnityEngine.Events.UnityEvent<Transform>();
+
+        [Tooltip("Dash ability icon with the radial cooldown sweep. Optional.")]
+        public DashCooldownIcon DashCooldownIcon;
 
         // The view LocalPlayerSpawned last fired for, so it fires once per spawn
         // (snapshots arrive 30 times a second; listeners must not).
@@ -65,6 +77,10 @@ namespace KnockKnockArena.Networking
         public long SnapshotsAccepted => _client?.SnapshotsAccepted ?? 0;
         public uint InputsSent => _client?.InputIndex ?? 0;
         public int HeartbeatsSent => _client?.HeartbeatsSent ?? 0;
+        public int UnackedInputs => _pendingInputs.Count;
+        public long Reconciliations { get; private set; }
+        public long BitMismatches { get; private set; }
+        public string FirstMismatch { get; private set; } = "";
 
         // A chat line and a joined/left line, ready to show.
         public event Action<string> ChatReceived;
@@ -90,6 +106,33 @@ namespace KnockKnockArena.Networking
 
         // Space is edge-triggered (dash): captured per frame, consumed by ONE input tick.
         private bool _dashQueued;
+        private MovementBits _lastSampledMovement;
+
+        // Client-side prediction: the local player's own simulation.
+        private bool _predictionInitialized;
+        private float _predictedX;
+        private float _predictedZ;
+        private MovementSimulation.DashState _predictedDash;
+
+        // Render interpolation: the simulation steps in fixed 1/30 s ticks, but the
+        // screen runs at frame rate — so the view blends between the previous and
+        // current predicted position by the accumulator fraction.
+        private float _prevPredictedX;
+        private float _prevPredictedZ;
+
+        // Reconciliation: every input the server has not acknowledged yet. They carry
+        // the aim too: movement is character-relative, so replay needs the exact aim.
+        private readonly List<(uint Index, MovementBits Movement, float AimX, float AimZ)> _pendingInputs =
+            new List<(uint, MovementBits, float, float)>();
+
+        private static MovementSimulation.DashState DashOf(PlayerEntityState player) =>
+            new MovementSimulation.DashState
+            {
+                TicksLeft = player.DashTicksLeft,
+                CooldownTicks = player.DashCooldownTicks,
+                DirectionX = player.DashDirectionX,
+                DirectionZ = player.DashDirectionZ,
+            };
 
         private void Update()
         {
@@ -119,6 +162,7 @@ namespace KnockKnockArena.Networking
                 ApplySnapshot(snapshot);
 
             SampleAndSendInputs();
+            UpdateDashIcon();
         }
 
         // ------------------------------------------------------------- connection
@@ -141,6 +185,11 @@ namespace KnockKnockArena.Networking
             _usernames.Clear();
 
             _inputAccumulator = 0f;
+            _predictionInitialized = false;
+            _pendingInputs.Clear();
+            Reconciliations = 0;
+            BitMismatches = 0;
+            FirstMismatch = "";
 
             foreach (GameObject view in _playerViews.Values)
                 Destroy(view);
@@ -295,15 +344,26 @@ namespace KnockKnockArena.Networking
                     _characterVisuals[player.EntityId] = view.GetComponent<CharacterVisual>();
                 }
 
-                // Lockstep: everyone, you included, stands where the server says and
-                // faces the aim point the snapshot carries.
-                view.transform.position = new Vector3(player.X, PlayerY, player.Z);
-                SetAim(player.EntityId, player.AimX, player.AimZ);
-
-                if (player.EntityId == _client.PlayerId && _announcedLocalView != view.transform)
+                if (player.EntityId == _client.PlayerId)
                 {
-                    _announcedLocalView = view.transform;
-                    LocalPlayerSpawned.Invoke(view.transform);
+                    Reconcile(player, snapshot.LastProcessedInputIndex);
+                    
+                    // The own view renders at the PREDICTED position (per frame, in
+                    // SampleAndSendInputs).
+                    view.transform.position = new Vector3(_predictedX, PlayerY, _predictedZ);
+
+                    if (_announcedLocalView != view.transform)
+                    {
+                        _announcedLocalView = view.transform;
+                        LocalPlayerSpawned.Invoke(view.transform);
+                    }
+                }
+                else
+                {
+                    // Other players: the newest snapshot position (M07 interpolates),
+                    // turned toward the aim point the snapshot carries for them.
+                    view.transform.position = new Vector3(player.X, PlayerY, player.Z);
+                    SetAim(player.EntityId, player.AimX, player.AimZ);
                 }
             }
 
@@ -319,6 +379,23 @@ namespace KnockKnockArena.Networking
             }
         }
 
+        /// <summary>
+        /// Drives the dash icon off the PREDICTED dash state, the same state the movement
+        /// prediction runs on, so the sweep starts on the keypress. The cooldown counts from
+        /// dash START (the rule in MovementSimulation), so the sweep includes the dash itself.
+        /// </summary>
+        private void UpdateDashIcon()
+        {
+            if (DashCooldownIcon == null)
+                return;
+
+            bool show = _client != null && _client.InGame && _predictionInitialized;
+            DashCooldownIcon.gameObject.SetActive(show);
+            if (show)
+                DashCooldownIcon.Set(_predictedDash.CooldownTicks, GameConstants.DashCooldownTicks,
+                    GameConstants.TickRate);
+        }
+
         /// <summary>Turns a player's figure toward an aim point. W moves toward the aim,
         /// so the figure's facing is the movement rule made visible.</summary>
         private void SetAim(ushort playerId, float aimX, float aimZ)
@@ -327,22 +404,95 @@ namespace KnockKnockArena.Networking
                 visual.SetAimPoint(new Vector3(aimX, PlayerY, aimZ));
         }
 
+        /// <summary>
+        /// Server reconciliation: start from the authoritative position, drop
+        /// acknowledged inputs, replay the rest with the shared simulation, and
+        /// compare the result bit for bit with the running prediction.
+        /// </summary>
+        private void Reconcile(PlayerEntityState me, uint lastProcessedInputIndex)
+        {
+            if (!_predictionInitialized)
+            {
+                _predictedX = me.X;
+                _predictedZ = me.Z;
+                _prevPredictedX = me.X;
+                _prevPredictedZ = me.Z;
+                _predictedDash = DashOf(me);
+                _predictionInitialized = true;
+                return;
+            }
+
+            // Prediction or reconciliation switched off in the HUD: take the server's
+            // position as-is and throw the unacknowledged inputs away. With prediction
+            // off that is simply "no local simulation" — you watch yourself move a
+            // round trip late. With prediction still ON you run one tick ahead, and
+            // every snapshot pulls you back to where the server had you a round trip
+            // ago: it feels like lockstep, with small hops, because nothing replays
+            // the inputs the server has not seen yet.
+            if (!EnablePrediction || !EnableReconciliation)
+            {
+                _pendingInputs.Clear();
+                _predictedX = me.X;
+                _predictedZ = me.Z;
+                _prevPredictedX = me.X;
+                _prevPredictedZ = me.Z;
+                _predictedDash = DashOf(me);
+                return;
+            }
+
+            _pendingInputs.RemoveAll(input => input.Index <= lastProcessedInputIndex);
+            
+            
+
+            float replayedX = me.X;
+            float replayedZ = me.Z;
+            MovementSimulation.DashState replayedDash = DashOf(me);
+            foreach ((uint _, MovementBits movement, float aimX, float aimZ) in _pendingInputs)
+                MovementSimulation.Step(ref replayedX, ref replayedZ, ref replayedDash,
+                    movement, aimX, aimZ, GameConstants.TickDeltaTime);
+
+            Reconciliations++;
+            bool identical =
+                BitConverter.SingleToInt32Bits(replayedX) == BitConverter.SingleToInt32Bits(_predictedX) &&
+                BitConverter.SingleToInt32Bits(replayedZ) == BitConverter.SingleToInt32Bits(_predictedZ);
+            if (!identical)
+            {
+                BitMismatches++;
+                if (FirstMismatch.Length == 0)
+                    FirstMismatch = $"predicted=({_predictedX:R}, {_predictedZ:R}) reconciled=({replayedX:R}, {replayedZ:R})";
+                // A genuine correction is a snap, not something to smear over frames.
+                _prevPredictedX = replayedX;
+                _prevPredictedZ = replayedZ;
+            }
+
+            _predictedX = replayedX;
+            _predictedZ = replayedZ;
+            _predictedDash = replayedDash;
+        }
+
         // ------------------------------------------------------------- input
 
-        // SampleAndSendInputs skrives her i videoen (Modul 6 kort version, implementering 4)
         private void SampleAndSendInputs()
         {
             if (_client == null || !_client.InGame)
                 return;
+
+            // One input per server tick (30 Hz), regardless of frame rate — sampled
+            // with an accumulator. Every input also resets the heartbeat timer, so
+            // while you are playing the heartbeat sends nothing at all.
             _inputAccumulator += Time.deltaTime;
             while (_inputAccumulator >= GameConstants.TickDeltaTime)
             {
                 _inputAccumulator -= GameConstants.TickDeltaTime;
+
+                // While the chat field has keyboard focus the player stands still and
+                // sends nothing: the heartbeat keeps the session alive.
                 if (IsTyping)
                 {
                     _dashQueued = false;
                     continue;
                 }
+
                 MovementBits movement = MovementBits.None;
                 if (Input.GetKey(KeyCode.W)) movement |= MovementBits.W;
                 if (Input.GetKey(KeyCode.A)) movement |= MovementBits.A;
@@ -351,11 +501,50 @@ namespace KnockKnockArena.Networking
                 if (Input.GetKey(KeyCode.LeftControl)) movement |= MovementBits.Walk;
                 if (Input.GetKey(KeyCode.LeftShift)) movement |= MovementBits.Sprint;
                 if (_dashQueued) movement |= MovementBits.Dash;
-                _dashQueued = false;
+                _dashQueued = false; // consumed by exactly one input tick
+                _lastSampledMovement = movement;
+
                 Vector3 aim = AimSource != null && AimSource.HasAim
                     ? AimSource.AimPoint
                     : Vector3.zero;
-                    _client.SendInput(movement, aim.x, aim.z, ButtonBits.None, 0);
+
+                uint inputIndex = _client.SendInput(movement, aim.x, aim.z, ButtonBits.None, 0);
+
+                // Client-side prediction: apply the input locally NOW — zero perceived
+                // latency — and remember it for reconciliation replay.
+                if (_predictionInitialized && EnablePrediction)
+                {
+                    _prevPredictedX = _predictedX;
+                    _prevPredictedZ = _predictedZ;
+                    MovementSimulation.Step(ref _predictedX, ref _predictedZ, ref _predictedDash,
+                        movement, aim.x, aim.z, GameConstants.TickDeltaTime);
+                    _pendingInputs.Add((inputIndex, movement, aim.x, aim.z));
+                }
+            }
+
+            // The own view follows the prediction every frame, blended between the
+            // last two fixed steps by the accumulator fraction (render interpolation).
+            if (_predictionInitialized && _playerViews.TryGetValue(_client.PlayerId, out GameObject ownView))
+            {
+                float alpha = Mathf.Clamp01(_inputAccumulator / GameConstants.TickDeltaTime);
+                ownView.transform.position = new Vector3(
+                    Mathf.Lerp(_prevPredictedX, _predictedX, alpha),
+                    PlayerY,
+                    Mathf.Lerp(_prevPredictedZ, _predictedZ, alpha));
+
+                // The own figure's cosmetics come from the PREDICTION too: it turns
+                // toward the cursor and runs, sprints or dashes with zero latency.
+                if (_characterVisuals.TryGetValue(_client.PlayerId, out CharacterVisual ownVisual) && ownVisual != null)
+                {
+                    MovementBits m = _lastSampledMovement;
+                    bool moving = (m & (MovementBits.W | MovementBits.A | MovementBits.S | MovementBits.D)) != 0;
+                    bool sprinting = (m & MovementBits.Sprint) != 0 && (m & MovementBits.W) != 0
+                                  && (m & MovementBits.S) == 0 && (m & MovementBits.Walk) == 0;
+                    ownVisual.SetMotionState(moving, sprinting, _predictedDash.TicksLeft > 0,
+                        GameConstants.DashDurationTicks * GameConstants.TickDeltaTime);
+                    if (AimSource != null && AimSource.HasAim)
+                        SetAim(_client.PlayerId, AimSource.AimPoint.x, AimSource.AimPoint.z);
+                }
             }
         }
     }

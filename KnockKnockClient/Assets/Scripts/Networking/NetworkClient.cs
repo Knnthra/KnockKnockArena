@@ -311,9 +311,7 @@ namespace KnockKnockArena.Networking
                 if (!_snapshotIsNew)
                 {
                     snapshot = null!;
-                    _snapshotIsNew = false;
-                    snapshot = _latestSnapshot!;
-                    return true;
+                    return false;
                 }
                 _snapshotIsNew = false;
                 snapshot = _latestSnapshot!;
