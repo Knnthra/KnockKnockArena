@@ -1,14 +1,17 @@
 using System.Collections.Generic;
+using KnockKnockArena.Shared.Protocol.Udp;
 using UnityEngine;
 
 namespace KnockKnockArena.Networking
 {
     /// <summary>
-    /// Handed out (Moodle), module 5 after implementation 4: the dev UI — connect panel,
-    /// HUD with the UDP join and heartbeat counters, chat and the joined/left feed. It
-    /// replaces module 4's NetworkHud.cs. It only reads NetworkBootstrap's public
-    /// properties, listens to its two events and calls its public methods; it never
-    /// touches the network. Put it in Assets/Scripts/Networking next to NetworkBootstrap.
+    /// Handed out (Moodle), module 6 after implementation 6: the dev UI — connect panel
+    /// with the latency field, "Find LAN servers" and the list of servers that answered,
+    /// HUD with the UDP counters (joins, snapshots, inputs, heartbeats), the latency
+    /// slider and the key line, chat and the joined/left feed. It replaces module 5's
+    /// NetworkHud.cs. It only reads NetworkBootstrap's public properties, sets its
+    /// connect fields, SimulatedLatencyMs and IsTyping, listens to its two events and
+    /// calls its public methods; it never touches the network. Put it in Assets/Scripts/Networking next to NetworkBootstrap.
     /// It adds itself to the NetworkBootstrap object when the scene starts, so nothing in
     /// the scene changes.
     /// </summary>
@@ -32,6 +35,9 @@ namespace KnockKnockArena.Networking
         private bool _chatFocusRequested;
         private readonly List<(string Text, float Time)> _feed = new List<(string, float)>();
 
+        // How far the list of LAN servers is scrolled.
+        private Vector2 _serverListScroll;
+
         private void Awake()
         {
             _net = GetComponent<NetworkBootstrap>();
@@ -54,10 +60,17 @@ namespace KnockKnockArena.Networking
             // A dropped connection closes the chat line.
             if (!_net.IsLoggedIn && _chatOpen)
             {
-                _chatOpen = false;
+                SetChatOpen(false);
                 _chatFocusRequested = false;
                 _chatInput = "";
             }
+        }
+
+        // The open chat line takes the keys, so NetworkBootstrap stops moving the player.
+        private void SetChatOpen(bool open)
+        {
+            _chatOpen = open;
+            _net.IsTyping = open;
         }
 
         private void AddChatLine(string line)
@@ -98,7 +111,7 @@ namespace KnockKnockArena.Networking
         {
             // Solid black panel with white text: the default box is see-through, and
             // the rest of the dev UI draws black text for the in-game overlay.
-            Rect panel = new Rect(20, 20, 400, 220);
+            Rect panel = new Rect(20, 20, 400, 390);
             Color previousColor = GUI.color;
             Color previousContent = GUI.contentColor;
             GUI.color = Color.black;
@@ -124,25 +137,78 @@ namespace KnockKnockArena.Networking
             GUILayout.Label("Password", GUILayout.Width(70));
             _net.Password = GUILayout.PasswordField(_net.Password, '*');
             GUILayout.EndHorizontal();
+            GUILayout.BeginHorizontal();
+            GUILayout.Label("Latency ms", GUILayout.Width(70));
+            int.TryParse(GUILayout.TextField(_net.SimulatedLatencyMs.ToString()), out _net.SimulatedLatencyMs);
+            GUILayout.EndHorizontal();
 
+            GUILayout.BeginHorizontal();
             GUI.enabled = !_net.IsConnecting;
             if (GUILayout.Button("Connect"))
                 _net.Connect();
+            GUI.enabled = !_net.IsConnecting && !_net.IsSearchingLan;
+            if (GUILayout.Button("Find LAN servers"))
+                _net.FindLanServers();
             GUI.enabled = true;
+            GUILayout.EndHorizontal();
+            DrawServerList();
 
             GUILayout.Label(_net.StatusLine);
             GUILayout.EndArea();
             GUI.contentColor = previousContent;
         }
 
+        private void DrawServerList()
+        {
+            if (_net.LanStatus.Length == 0)
+                return;
+
+            _serverListScroll = GUILayout.BeginScrollView(_serverListScroll, GUILayout.Height(120));
+            GUILayout.Label(_net.LanStatus);
+            foreach (DiscoveredServer server in _net.LanServers)
+            {
+                GUILayout.BeginHorizontal();
+                if (server.Info == null)
+                {
+                    GUILayout.Label($"{server.Address}:{server.SourcePort}  protocol v{server.ProtocolVersion} (incompatible)");
+                }
+                else
+                {
+                    GUILayout.Label($"{server.Info.ServerName}  {server.Info.PlayersOnline}/{server.Info.MaxPlayers}");
+                    GUI.enabled = !_net.IsConnecting;
+                    if (GUILayout.Button("Join", GUILayout.Width(50)))
+                        _net.JoinLanServer(server);
+                    GUI.enabled = true;
+                }
+                GUILayout.EndHorizontal();
+            }
+            GUILayout.EndScrollView();
+        }
+
         private void DrawHud()
         {
-            GUILayout.BeginArea(new Rect(20, 20, 780, 100));
+            GUILayout.BeginArea(new Rect(20, 20, 780, 160));
             GUILayout.Label(_net.InGame ? "In the game (UDP)" : _net.StatusLine);
-            GUILayout.Label($"UDP: joins sent={_net.JoinsSent}  heartbeats={_net.HeartbeatsSent}");
+            GUILayout.Label($"UDP: joins sent={_net.JoinsSent}  snapshots={_net.SnapshotsAccepted}  " +
+                            $"inputs sent={_net.InputsSent}  heartbeats={_net.HeartbeatsSent}");
             GUILayout.Label($"{_net.ServerInfoLine}  |  unknown TCP messages skipped: {_net.TcpMessagesSkipped}");
-            GUILayout.Label("Enter chat");
+            DrawTechniqueToggles();
+            GUILayout.Label("WASD move  |  Shift sprint  |  Ctrl walk  |  Space dash  |  Enter chat");
             GUILayout.EndArea();
+        }
+
+        /// <summary>
+        /// The latency simulator, switchable WHILE PLAYING. The slider only sets
+        /// NetworkBootstrap.SimulatedLatencyMs; NetworkBootstrap pushes it into the
+        /// client every frame — no reconnect needed.
+        /// </summary>
+        private void DrawTechniqueToggles()
+        {
+            GUILayout.BeginHorizontal();
+            GUILayout.Label($"latency {_net.SimulatedLatencyMs} ms/way", GUILayout.Width(120));
+            _net.SimulatedLatencyMs = Mathf.RoundToInt(
+                GUILayout.HorizontalSlider(_net.SimulatedLatencyMs, 0f, 300f, GUILayout.Width(100)));
+            GUILayout.EndHorizontal();
         }
 
         private void HandleChatKeys()
@@ -155,7 +221,7 @@ namespace KnockKnockArena.Networking
             {
                 if (!_chatOpen)
                 {
-                    _chatOpen = true;
+                    SetChatOpen(true);
                     _chatFocusRequested = true;
                 }
                 else
@@ -163,7 +229,7 @@ namespace KnockKnockArena.Networking
                     if (!string.IsNullOrWhiteSpace(_chatInput))
                         _net.SendChat(_chatInput.Trim());
                     _chatInput = "";
-                    _chatOpen = false;
+                    SetChatOpen(false);
                     GUIUtility.keyboardControl = 0;
                 }
                 current.Use();
@@ -171,7 +237,7 @@ namespace KnockKnockArena.Networking
             else if (current.keyCode == KeyCode.Escape && _chatOpen)
             {
                 _chatInput = "";
-                _chatOpen = false;
+                SetChatOpen(false);
                 GUIUtility.keyboardControl = 0;
                 current.Use();
             }

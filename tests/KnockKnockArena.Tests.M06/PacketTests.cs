@@ -63,7 +63,8 @@ public class PacketTests
     public void Input_Truncated_IsMalformed()
     {
         byte[] datagram = Bytes(InputDump).Take(15).ToArray(); // cut inside aimX
-        Assert.Throws<ProtocolException>(() => InputPacket.FromDatagram(datagram));
+        ProtocolException error = Assert.Throws<ProtocolException>(() => InputPacket.FromDatagram(datagram));
+        Assert.Equal("malformed payload", error.Reason);
     }
 
     // ------------------------------------------------------------------ SnapshotPacket
@@ -134,7 +135,8 @@ public class PacketTests
         // count 1, entity id 01 00, entity type 99: entities have no length prefix, so
         // an unknown type cannot be skipped.
         byte[] datagram = Bytes("64-06-07-00-00-00-09-00-00-00-05-00-00-00-01-01-00-63-00-00");
-        Assert.Throws<ProtocolException>(() => SnapshotPacket.FromDatagram(datagram));
+        ProtocolException error = Assert.Throws<ProtocolException>(() => SnapshotPacket.FromDatagram(datagram));
+        Assert.Equal("unknown entity type 99", error.Reason);
     }
 
     [Fact]
@@ -144,7 +146,8 @@ public class PacketTests
         snapshot.Players.Add(Anna());
         byte[] datagram = snapshot.ToDatagram().Take(40).ToArray(); // cut inside the player
 
-        Assert.Throws<ProtocolException>(() => SnapshotPacket.FromDatagram(datagram));
+        ProtocolException error = Assert.Throws<ProtocolException>(() => SnapshotPacket.FromDatagram(datagram));
+        Assert.Equal("malformed payload", error.Reason);
     }
 
     [Fact]
@@ -153,6 +156,7 @@ public class PacketTests
         byte[] datagram = new SnapshotPacket { Sequence = 7 }.ToDatagram();
         datagram[1] = 5;
 
-        Assert.Throws<ProtocolException>(() => SnapshotPacket.FromDatagram(datagram));
+        ProtocolException error = Assert.Throws<ProtocolException>(() => SnapshotPacket.FromDatagram(datagram));
+        Assert.Equal("bad version 5", error.Reason);
     }
 }

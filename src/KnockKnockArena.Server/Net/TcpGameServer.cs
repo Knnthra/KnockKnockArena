@@ -149,8 +149,8 @@ namespace KnockKnockArena.Server.Net
                     TickRate = GameConstants.TickRate,
                     MaxPlayers = (byte)_config.MaxPlayers,
                     PlayersOnline = (byte)_sessions.Count,
-                    MapName = "",
-                    MapHash = 0,
+                    MapName = ArenaMap.Name,
+                    MapHash = ArenaMap.Hash,
                 }.ToPayload());
 
                 Broadcast(MessageType.PlayerJoined, new PlayerJoined

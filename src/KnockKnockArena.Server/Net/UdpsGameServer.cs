@@ -58,7 +58,9 @@ public sealed class UdpGameServer
             case UdpPacketType.Join:
                 HandleJoin(JoinPacket.FromDatagram(datagram), remote);
                 break;
-            
+            case UdpPacketType.Input:
+                HandleInput(InputPacket.FromDatagram(datagram), remote);
+                break;
             case UdpPacketType.Heartbeat:
                 HandleHeartbeat(HeartbeatPacket.FromDatagram(datagram), remote);
                 break;
@@ -107,6 +109,20 @@ public sealed class UdpGameServer
                          Log.Info($"UDP rebind: {session!.Username}#{session.PlayerId} now at {remote}");
     }
     
+    private void HandleInput(InputPacket input, IPEndPoint remote)
+    {
+        if (!_world.TryGetByEndPoint(remote, out PlayerState player))
+            throw new ProtocolException("unknown endpoint");
+        if (input.PlayerId != player.Session.PlayerId)
+            throw new ProtocolException($"bad player id {input.PlayerId}");
+            
+            player.LastUdpPacketUtc = DateTime.UtcNow;
+            if (!_world.TryEnqueueInput(player, input))
+                throw new ProtocolException("input queue full");
+        
+    }
+    
+    
     private void HandleHeartbeat(HeartbeatPacket heartbeat, IPEndPoint remote)
     {
         if (!_world.TryGetByEndPoint(remote, out PlayerState player))
@@ -126,7 +142,7 @@ public sealed class UdpGameServer
             PlayersOnline = (byte)_sessions.Count,
             MaxPlayers = (byte)_config.MaxPlayers,
             ServerName = _config.ServerName,
-            MapName = "",
+            MapName = ArenaMap.Name,
             
         }.ToDatagram();
         _udp!.Send(answer, answer.Length, remote);
@@ -138,7 +154,7 @@ public sealed class UdpGameServer
         Stopwatch clock = Stopwatch.StartNew();
         double tickIntervalMs = 1000.0 / GameConstants.TickRate;
         double nextTickAtMs = tickIntervalMs;
-    
+        List<(IPEndPoint EndPoint, byte[] Datagram)> snapshotSends = new();
         List<PlayerState> timedOut = new();
         while (true)
         {
@@ -154,9 +170,20 @@ public sealed class UdpGameServer
                 nextTickAtMs = clock.Elapsed.TotalMilliseconds;
             }
             nextTickAtMs += tickIntervalMs;
-            
+            snapshotSends.Clear();
             timedOut.Clear();
-            _world.Tick(timedOut);
+            _world.Tick(snapshotSends, timedOut);
+            
+            foreach ((IPEndPoint endPoint, byte[] datagram) in snapshotSends)
+            {
+                try
+                {
+                    _udp!.Send(datagram, datagram.Length, endPoint);
+                }
+                catch (SocketException)
+                {
+                }
+            }
             foreach (PlayerState player in timedOut)
             {
                 Log.Info($"UDP timeout: {player.Session.Username}#{player.Session.PlayerId} " +
