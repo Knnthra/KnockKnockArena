@@ -18,7 +18,7 @@ namespace KnockKnockArena.Server.Net;
 /// packets, and a tick thread that advances the world at a fixed 30 Hz and sends a
 /// full snapshot to every joined player each tick.
 ///
-/// Module 6: inputs and snapshots on top of M05's join, heartbeat, timeout and discovery.
+/// Module 7: pickups in the snapshot, and taken pickups announced on TCP.
 /// </summary>
 public sealed class UdpGameServer
 {
@@ -30,6 +30,10 @@ public sealed class UdpGameServer
     /// <summary>Wired to TcpGameServer.KickByPlayerId: a UDP timeout disconnects the
     /// player entirely, which also produces the PlayerLeft event on TCP.</summary>
     public Action<byte, string>? KickPlayer;
+
+    /// <summary>Wired to TcpGameServer.BroadcastPickupTaken: taking a pickup is an
+    /// event every client must hear about, so it goes on the reliable channel.</summary>
+    public Action<PickupTakenEvent>? PickupTaken;
 
     public UdpGameServer(ServerConfig config, SessionManager sessions, GameWorld world)
     {
@@ -213,6 +217,7 @@ public sealed class UdpGameServer
 
         List<(IPEndPoint EndPoint, byte[] Datagram)> snapshotSends = new();
         List<PlayerState> timedOut = new();
+        List<PickupTakenEvent> pickupsTaken = new();
 
         while (true)
         {
@@ -233,7 +238,12 @@ public sealed class UdpGameServer
 
             snapshotSends.Clear();
             timedOut.Clear();
-            _world.Tick(snapshotSends, timedOut);
+            pickupsTaken.Clear();
+            _world.Tick(snapshotSends, timedOut, pickupsTaken);
+
+            foreach (PickupTakenEvent pickup in pickupsTaken)
+                PickupTaken?.Invoke(pickup);
+            
 
             foreach ((IPEndPoint endPoint, byte[] datagram) in snapshotSends)
             {

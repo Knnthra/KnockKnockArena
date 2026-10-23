@@ -3,6 +3,6 @@
   <Project Path="KnockKnockArena.Gameplay.csproj" />
   <Project Path="KnockKnockArena.Shared.csproj" />
   <Project Path="Assembly-CSharp-Editor.csproj" />
-  <Project Path="KnockKnockArena.Gameplay.Editor.csproj" />
   <Project Path="KnockKnockArena.Networking.csproj" />
+  <Project Path="KnockKnockArena.Gameplay.Editor.csproj" />
 </Solution>

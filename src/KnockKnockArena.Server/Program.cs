@@ -55,6 +55,10 @@ server.PlayerDisconnected += session =>
 };
 // UDP silence -> full disconnect (S01: timeout gives a TCP event + despawn).
 udpServer.KickPlayer = server.KickByPlayerId;
+// Pickups taken in the tick loop -> an event on TCP.
+udpServer.PickupTaken = pickup =>
+    server.BroadcastPickupTaken(pickup.PlayerId, pickup.PlayerName, pickup.PickupId, (byte)pickup.Type);
+
 
 server.Start();
 udpServer.Start();

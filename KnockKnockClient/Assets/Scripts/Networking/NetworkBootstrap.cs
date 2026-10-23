@@ -14,10 +14,11 @@ namespace KnockKnockArena.Networking
     /// student base project is produced by deleting the Networking folder and this
     /// object from the scene.
     ///
-    /// MODULE 6: movement. Inputs are sampled at the tick rate and sent; the local
-    /// player is predicted with the SHARED MovementSimulation the instant an input is
-    /// sampled and reconciled bit for bit against every snapshot. Other players are
-    /// drawn at their snapshot position (interpolation comes in M07). The dev UI is
+    /// MODULE 7: entities and interpolation. The local player is predicted and
+    /// reconciled as in M06. Other players render a few ticks in the past, blended
+    /// between buffered snapshots in position AND aim ("you see yourself in the
+    /// present — everyone else in the past"). Pickups are entities: the scene's own
+    /// pickup objects are shown and hidden by the snapshot's Active flag. The dev UI is
     /// NetworkHud (handed out): it only reads the public properties below, listens to
     /// the two events and calls the public methods. Nothing here draws anything.
     /// </summary>
@@ -33,6 +34,9 @@ namespace KnockKnockArena.Networking
         [Tooltip("Delay on all UDP traffic, each way, in ms. 2x this = simulated round trip.")]
         public int SimulatedLatencyMs = 0;
 
+        [Tooltip("Random ± variation on the simulated latency, per datagram, in ms.")]
+        public int SimulatedJitterMs = 0;
+
         [Tooltip("Simulate your own movement immediately instead of waiting for the server.")]
         public bool EnablePrediction = true;
 
@@ -40,6 +44,10 @@ namespace KnockKnockArena.Networking
                  "straight to the server's position: you trail a round trip behind " +
                  "and hop back about 0.2 m - it feels like lockstep.")]
         public bool EnableReconciliation = true;
+
+        [Tooltip("Render other players a few ticks in the past, blended between " +
+                 "snapshots. Off = jump to the newest snapshot (visible teleporting).")]
+        public bool EnableInterpolation = true;
 
         [Header("Gameplay couplings")]
         public CursorAim AimSource;
@@ -75,6 +83,7 @@ namespace KnockKnockArena.Networking
         public bool InGame => _client?.InGame ?? false;
         public long JoinsSent => _client?.JoinsSent ?? 0;
         public long SnapshotsAccepted => _client?.SnapshotsAccepted ?? 0;
+        public long SnapshotsDropped => _client?.SnapshotsDropped ?? 0;
         public uint InputsSent => _client?.InputIndex ?? 0;
         public int HeartbeatsSent => _client?.HeartbeatsSent ?? 0;
         public int UnackedInputs => _pendingInputs.Count;
@@ -82,7 +91,7 @@ namespace KnockKnockArena.Networking
         public long BitMismatches { get; private set; }
         public string FirstMismatch { get; private set; } = "";
 
-        // A chat line and a joined/left line, ready to show.
+        // A chat line, and a feed line (joined, left, took a pickup), ready to show.
         public event Action<string> ChatReceived;
         public event Action<string> PlayerFeed;
 
@@ -100,6 +109,20 @@ namespace KnockKnockArena.Networking
         // (null for the cube placeholder).
         private readonly Dictionary<ushort, GameObject> _playerViews = new Dictionary<ushort, GameObject>();
         private readonly Dictionary<ushort, CharacterVisual> _characterVisuals = new Dictionary<ushort, CharacterVisual>();
+        private readonly Dictionary<ushort, byte> _remoteDashTicks = new Dictionary<ushort, byte>();
+
+        // Entity interpolation: remote players render on the server-tick timeline,
+        // InterpolationDelayTicks behind the newest snapshot, blended between
+        // buffered samples. "You see everyone else in the past."
+        private const float InterpolationDelayTicks = 3f; // 100 ms of jitter headroom
+        private readonly Dictionary<ushort, InterpolationBuffer> _remoteBuffers = new Dictionary<ushort, InterpolationBuffer>();
+        private double _renderTick;
+        private bool _renderTickInitialized;
+        private uint _latestSnapshotTick;
+
+        // Pickups: the scene's own pickup objects, in the map's pickup order.
+        private readonly List<GameObject> _pickupViews = new List<GameObject>();
+        private bool _pickupViewsCreated;
 
         // Input sampling runs at the tick rate, not the frame rate.
         private float _inputAccumulator;
@@ -134,6 +157,14 @@ namespace KnockKnockArena.Networking
                 DirectionZ = player.DashDirectionZ,
             };
 
+        private void Start()
+        {
+            // The scene's ArenaMapStamp loaded the arena in Awake: bind its pickups now,
+            // so they are there before anyone connects.
+            if (ArenaMap.IsLoaded && !_pickupViewsCreated)
+                CreatePickupViews();
+        }
+
         private void Update()
         {
             // The search thread's result, copied on the main thread for the HUD.
@@ -150,10 +181,11 @@ namespace KnockKnockArena.Networking
             if (_client == null)
                 return; // the queue held a disconnect
 
-            // The latency simulator is switchable WHILE PLAYING (the HUD has a slider).
-            // It is pushed into the client every frame because the client reads it per
-            // packet — no reconnect needed.
+            // The latency simulator is switchable WHILE PLAYING (the HUD has a slider
+            // for latency and one for jitter). Both are pushed into the client every
+            // frame because the client reads them per packet — no reconnect needed.
             _client.SimulatedLatencyMs = SimulatedLatencyMs;
+            _client.SimulatedJitterMs = SimulatedJitterMs;
 
             if (Input.GetKeyDown(KeyCode.Space) && !IsTyping)
                 _dashQueued = true;
@@ -161,6 +193,7 @@ namespace KnockKnockArena.Networking
             if (_client.TryTakeSnapshot(out SnapshotPacket snapshot))
                 ApplySnapshot(snapshot);
 
+            UpdateRemoteViews();
             SampleAndSendInputs();
             UpdateDashIcon();
         }
@@ -171,7 +204,7 @@ namespace KnockKnockArena.Networking
         {
             IsConnecting = true;
             StatusLine = $"Connecting to {Host}:{Port}...";
-            _client = new NetworkClient { SimulatedLatencyMs = SimulatedLatencyMs };
+            _client = new NetworkClient { SimulatedLatencyMs = SimulatedLatencyMs, SimulatedJitterMs = SimulatedJitterMs };
             _client.ConnectAndLogin(Host, Port, Username, Password);
         }
 
@@ -195,6 +228,13 @@ namespace KnockKnockArena.Networking
                 Destroy(view);
             _playerViews.Clear();
             _characterVisuals.Clear();
+            _remoteDashTicks.Clear();
+            _remoteBuffers.Clear();
+            _renderTickInitialized = false;
+
+            // The scene's pickups stay in the scene; offline, they are all there.
+            foreach (GameObject pickup in _pickupViews)
+                pickup.SetActive(true);
             if (_announcedLocalView != null)
             {
                 _announcedLocalView = null;
@@ -312,6 +352,10 @@ namespace KnockKnockArena.Networking
                         PlayerFeed?.Invoke($"{left.Username} left");
                         break;
 
+                    case PickupTaken taken:
+                        PlayerFeed?.Invoke($"{taken.Username} took {taken.Type}");
+                        break;
+
                     case TcpDisconnectedEvent disconnected:
                         Disconnect($"Disconnected: {disconnected.Reason}");
                         break;
@@ -347,7 +391,6 @@ namespace KnockKnockArena.Networking
                 if (player.EntityId == _client.PlayerId)
                 {
                     Reconcile(player, snapshot.LastProcessedInputIndex);
-                    
                     // The own view renders at the PREDICTED position (per frame, in
                     // SampleAndSendInputs).
                     view.transform.position = new Vector3(_predictedX, PlayerY, _predictedZ);
@@ -360,10 +403,13 @@ namespace KnockKnockArena.Networking
                 }
                 else
                 {
-                    // Other players: the newest snapshot position (M07 interpolates),
-                    // turned toward the aim point the snapshot carries for them.
-                    view.transform.position = new Vector3(player.X, PlayerY, player.Z);
-                    SetAim(player.EntityId, player.AimX, player.AimZ);
+                    // Other players: position AND aim go into the buffer; both are
+                    // rendered in the past, blended between snapshots (UpdateRemoteViews).
+                    if (!_remoteBuffers.TryGetValue(player.EntityId, out InterpolationBuffer buffer))
+                        _remoteBuffers[player.EntityId] = buffer = new InterpolationBuffer();
+                    buffer.Add(snapshot.ServerTick, player.X, player.Z, player.AimX, player.AimZ);
+                    
+                    _remoteDashTicks[player.EntityId] = player.DashTicksLeft;
                 }
             }
 
@@ -376,6 +422,125 @@ namespace KnockKnockArena.Networking
                 Destroy(_playerViews[id]);
                 _playerViews.Remove(id);
                 _characterVisuals.Remove(id);
+                _remoteBuffers.Remove(id);
+                _remoteDashTicks.Remove(id);
+            }
+
+            // Steer the render clock: it should sit InterpolationDelayTicks behind
+            // the newest snapshot.
+            _latestSnapshotTick = snapshot.ServerTick;
+            
+            if (!_renderTickInitialized)
+            {
+                _renderTick = snapshot.ServerTick - InterpolationDelayTicks;
+                _renderTickInitialized = true;
+            }
+
+            // Pickups: the server says which are there to take.
+            for (int i = 0; i < snapshot.Pickups.Count && i < _pickupViews.Count; i++)
+                _pickupViews[i].SetActive(snapshot.Pickups[i].Active);
+        }
+
+        /// <summary>
+        /// Advances the render clock at tick rate and positions every remote view by
+        /// sampling its buffer at that (past) moment. The clock is pulled gently
+        /// toward its target so clock drift and jitter never cause visible jumps;
+        /// only a grossly wrong clock (join, long stall) snaps.
+        /// </summary>
+        private void UpdateRemoteViews()
+        {
+            if (!_renderTickInitialized)
+                return;
+
+            _renderTick += GameConstants.TickRate * (double)Time.deltaTime;
+
+            double target = _latestSnapshotTick - InterpolationDelayTicks;
+            double error = target - _renderTick;
+            if (error > 10 || error < -10)
+                _renderTick = target;
+            else
+                _renderTick += error * 0.05;
+
+            foreach (KeyValuePair<ushort, GameObject> entry in _playerViews)
+            {
+                if (entry.Key == _client.PlayerId)
+                    continue;
+                if (!_remoteBuffers.TryGetValue(entry.Key, out InterpolationBuffer buffer))
+                    continue;
+
+                // Interpolation OFF renders the newest snapshot raw: 30 Hz teleporting
+                // (and snapping to each new facing).
+                float x, z, aimX, aimZ;
+                bool has = EnableInterpolation
+                    ? buffer.TrySample(_renderTick, out x, out z, out aimX, out aimZ)
+                    : buffer.TryLatest(out x, out z, out aimX, out aimZ);
+                if (!has)
+                    continue;
+
+                Vector3 previousPosition = entry.Value.transform.position;
+                entry.Value.transform.position = new Vector3(x, PlayerY, z);
+
+                // Remote cosmetics: motion inferred from how fast the view is actually
+                // gliding (sprint reads as >7.5 m/s — between run 6 and sprint 9); dash
+                // comes from the snapshot's authoritative state; the aim is blended.
+                if (_characterVisuals.TryGetValue(entry.Key, out CharacterVisual visual) && visual != null)
+                {
+                    float speed = Time.deltaTime > 0f
+                        ? (entry.Value.transform.position - previousPosition).magnitude / Time.deltaTime
+                        : 0f;
+                    bool dashing = _remoteDashTicks.TryGetValue(entry.Key, out byte dashTicks) && dashTicks > 0;
+                    visual.SetMotionState(speed > 0.5f, speed > 7.5f, dashing,
+                        GameConstants.DashDurationTicks * GameConstants.TickDeltaTime);
+                    visual.SetAimPoint(new Vector3(aimX, PlayerY, aimZ));
+                }
+            }
+        }
+
+        /// <summary>
+        /// Binds each pickup in the map data to the object already standing in the
+        /// scene at that spot — the one the level author placed (its PickupMarker).
+        /// Nothing is spawned: the netcode's job is to show and hide what is already
+        /// there, following the server's Active flag. A pickup with no object in the
+        /// scene falls back to a coloured cube so the spot is not invisible.
+        /// </summary>
+        private void CreatePickupViews()
+        {
+            _pickupViewsCreated = true;
+            PickupMarker[] markers = FindObjectsByType<PickupMarker>(FindObjectsInactive.Include);
+
+            for (int i = 0; i < ArenaMap.Pickups.Length; i++)
+            {
+                (PickupType type, float x, float z) = ArenaMap.Pickups[i];
+
+                PickupMarker match = null;
+                float bestDistance = float.MaxValue;
+                foreach (PickupMarker marker in markers)
+                {
+                    if (marker.Type != type)
+                        continue;
+                    float dx = marker.transform.position.x - x;
+                    float dz = marker.transform.position.z - z;
+                    float distance = dx * dx + dz * dz;
+                    if (distance < bestDistance) { bestDistance = distance; match = marker; }
+                }
+
+                GameObject view;
+                if (match != null && bestDistance < 1f)
+                {
+                    view = match.gameObject;
+                }
+                else
+                {
+                    view = GameObject.CreatePrimitive(PrimitiveType.Cube);
+                    view.transform.position = new Vector3(x, ArenaMap.GroundY + 0.35f, z);
+                    view.transform.localScale = Vector3.one * 0.7f;
+                    Destroy(view.GetComponent<Collider>());
+                    view.GetComponent<Renderer>().material.color = new Color(1f, 0f, 1f);
+                    view.name = $"Pickup {i} ({type}) — MISSING in scene";
+                    Debug.LogWarning($"[Arena] Pickup {i} ({type}) is in the map data but has no " +
+                                     $"marker in the scene at ({x}, {z}) — re-export after moving it.");
+                }
+                _pickupViews.Add(view);
             }
         }
 
@@ -441,8 +606,6 @@ namespace KnockKnockArena.Networking
             }
 
             _pendingInputs.RemoveAll(input => input.Index <= lastProcessedInputIndex);
-            
-            
 
             float replayedX = me.X;
             float replayedZ = me.Z;

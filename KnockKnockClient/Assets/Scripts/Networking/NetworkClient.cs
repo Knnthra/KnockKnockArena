@@ -38,6 +38,15 @@ namespace KnockKnockArena.Networking
         /// trip is twice this). Makes latency problems visible on localhost.</summary>
         public int SimulatedLatencyMs;
 
+        /// <summary>Random variation added to the simulated latency, per datagram and
+        /// direction: each one is delayed latency ± up to this many ms. Uneven gaps are
+        /// what the interpolation buffer smooths out (M07) — and datagrams can overtake
+        /// each other, which the snapshot sequence check then drops.</summary>
+        public int SimulatedJitterMs;
+
+        private readonly Random _jitterRandom = new Random();
+        private readonly object _jitterGate = new object();
+
         public byte PlayerId { get; private set; }
 
         /// <summary>True once the first snapshot has arrived (= the UDP join succeeded).</summary>
@@ -51,6 +60,10 @@ namespace KnockKnockArena.Networking
         public long JoinsSent;
         public long UdpDatagramsReceived;
         public long SnapshotsAccepted;
+
+        /// <summary>Snapshots thrown away by the sequence check: older than (or a copy
+        /// of) the newest one already taken. Jitter reorders datagrams; this counts it.</summary>
+        public long SnapshotsDropped;
         public long UdpParseErrors;
         public long UdpForeignSourceDrops;
         public volatile string UdpLastForeignSource = "";
@@ -145,6 +158,9 @@ namespace KnockKnockArena.Networking
                             break;
                         case MessageType.PlayerLeft:
                             TcpMessages.Enqueue(PlayerLeft.FromPayload(payload));
+                            break;
+                        case MessageType.PickupTaken:
+                            TcpMessages.Enqueue(PickupTaken.FromPayload(payload));
                             break;
                         default:
                             // Unknown types are skipped: framing already consumed the
@@ -262,7 +278,7 @@ namespace KnockKnockArena.Networking
                         continue;
                     }
 
-                    int delayMs = SimulatedLatencyMs;
+                    int delayMs = SimulatedDelayMs();
                     if (delayMs <= 0)
                         HandleDatagram(datagram);
                     else
@@ -276,7 +292,6 @@ namespace KnockKnockArena.Networking
             }
         }
 
-        // HandleDatagram skrives her i videoen (Modul 6 kort version, implementering 5)
         private void HandleDatagram(byte[] datagram)
         {
             try
@@ -284,11 +299,16 @@ namespace KnockKnockArena.Networking
                 UdpPacketType type = UdpPacketIO.PeekType(datagram);
                 if (type != UdpPacketType.Snapshot)
                     return;
+
                 SnapshotPacket snapshot = SnapshotPacket.FromDatagram(datagram);
                 lock (_snapshotGate)
                 {
+                    // Sequence check: drop duplicates and out-of-order.
                     if (snapshot.Sequence <= _newestSequence)
+                    {
+                        Interlocked.Increment(ref SnapshotsDropped);
                         return;
+                    }
                     _newestSequence = snapshot.Sequence;
                     _latestSnapshot = snapshot;
                     _snapshotIsNew = true;
@@ -298,12 +318,13 @@ namespace KnockKnockArena.Networking
             }
             catch (ProtocolException)
             {
+                // Malformed datagram: drop it; the next snapshot is 33 ms away.
                 Interlocked.Increment(ref UdpParseErrors);
             }
-            
         }
 
-        // TryTakeSnapshot skrives her i videoen (Modul 6 kort version, implementering 5)
+        /// <summary>Hands out the newest snapshot once (returns false until a NEW one
+        /// has arrived since the last call). Polled from Update().</summary>
         public bool TryTakeSnapshot(out SnapshotPacket snapshot)
         {
             lock (_snapshotGate)
@@ -319,28 +340,32 @@ namespace KnockKnockArena.Networking
             }
         }
 
-        // SendInput skrives her i videoen (Modul 6 kort version, implementering 5)
+        /// <summary>Sends one input packet and returns its index (the prediction
+        /// layer records it for replay). Called at the fixed tick rate by the input
+        /// sampler. Every input also resets the heartbeat timer, so while you are
+        /// playing the heartbeat never needs to send anything — see
+        /// <see cref="HeartbeatLoop"/> for the gaps it covers.</summary>
         public uint SendInput(MovementBits movement, float aimX, float aimZ, ButtonBits buttons, byte weaponId)
         {
             uint tickEstimate;
             lock (_snapshotGate)
                 tickEstimate = _latestSnapshot?.ServerTick ?? 0;
-                uint index = ++_inputIndex;
-                UdpSend(new InputPacket
-                {
-                    PlayerId = PlayerId,
-                    InputIndex = index,
-                    Tick = tickEstimate,
-                    Movement = movement,
-                    AimX = aimX,
-                    AimZ = aimZ,
-                    Buttons = buttons,
-                    WeaponId = weaponId,
-                }.ToDatagram());
-                return index;
+
+            uint index = ++_inputIndex;
+            UdpSend(new InputPacket
+            {
+                PlayerId = PlayerId,
+                InputIndex = index,
+                Tick = tickEstimate,
+                Movement = movement,
+                AimX = aimX,
+                AimZ = aimZ,
+                Buttons = buttons,
+                WeaponId = weaponId,
+            }.ToDatagram());
+            return index;
         }
-        
-        
+
         /// <summary>
         /// Keeps the session alive when there is nothing else to send.
         ///
@@ -399,7 +424,7 @@ namespace KnockKnockArena.Networking
             // the latency simulator is in flight.
             LastUdpSendUtc = DateTime.UtcNow;
 
-            int delayMs = SimulatedLatencyMs;
+            int delayMs = SimulatedDelayMs();
             if (delayMs <= 0)
             {
                 try { udp.Send(datagram, datagram.Length, server); }
@@ -412,6 +437,21 @@ namespace KnockKnockArena.Networking
                 try { udp.Send(datagram, datagram.Length, server); }
                 catch (Exception ex) when (ex is SocketException || ex is ObjectDisposedException) { }
             });
+        }
+
+        /// <summary>This datagram's simulated delay: the latency plus a random jitter in
+        /// [-SimulatedJitterMs, +SimulatedJitterMs], never below 0. Called from the receive
+        /// thread and the main thread, hence the lock around the shared Random.</summary>
+        private int SimulatedDelayMs()
+        {
+            int latency = SimulatedLatencyMs;
+            int jitter = SimulatedJitterMs;
+            if (jitter <= 0)
+                return latency;
+            int offset;
+            lock (_jitterGate)
+                offset = _jitterRandom.Next(-jitter, jitter + 1);
+            return Math.Max(0, latency + offset);
         }
 
         public void Dispose()

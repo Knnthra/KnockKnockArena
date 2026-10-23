@@ -5,14 +5,16 @@ using UnityEngine;
 namespace KnockKnockArena.Networking
 {
     /// <summary>
-    /// Handed out (Moodle), module 6 after implementation 8: the dev UI — connect panel
+    /// Handed out (Moodle), module 7 after implementation 6: the dev UI — connect panel
     /// with the latency field, "Find LAN servers" and the list of servers that answered,
-    /// HUD with the UDP counters (joins, snapshots, inputs, heartbeats), the prediction
-    /// line (unacked inputs, reconciliations, bitMismatches, the first mismatch), the
-    /// prediction and reconciliation toggles, the latency slider and the key line, chat
-    /// and the joined/left feed. It replaces the NetworkHud.cs from implementation 7. It
-    /// only reads NetworkBootstrap's public properties, sets its connect fields,
-    /// SimulatedLatencyMs, EnablePrediction, EnableReconciliation and IsTyping, listens
+    /// HUD with the UDP counters (joins, snapshots, snapshots dropped out of order,
+    /// inputs, heartbeats), the prediction line (unacked inputs, reconciliations,
+    /// bitMismatches, the first mismatch), the prediction, reconciliation and
+    /// interpolation toggles, the latency and jitter sliders and the key line, chat and
+    /// the feed (joined, left, took a pickup). It replaces the NetworkHud.cs from
+    /// implementation 4. It only reads NetworkBootstrap's public properties, sets its
+    /// connect fields, SimulatedLatencyMs, SimulatedJitterMs, EnablePrediction,
+    /// EnableReconciliation, EnableInterpolation and IsTyping, listens
     /// to its two events and calls its public methods; it never touches the network. Put it in Assets/Scripts/Networking next to NetworkBootstrap.
     /// It adds itself to the NetworkBootstrap object when the scene starts, so nothing in
     /// the scene changes.
@@ -200,6 +202,7 @@ namespace KnockKnockArena.Networking
             GUILayout.BeginArea(new Rect(20, 20, 780, 160));
             GUILayout.Label(_net.InGame ? "In the game (UDP)" : _net.StatusLine);
             GUILayout.Label($"UDP: joins sent={_net.JoinsSent,3}  snapshots={_net.SnapshotsAccepted,7}  " +
+                            $"dropped (out of order)={_net.SnapshotsDropped,5}  " +
                             $"inputs sent={_net.InputsSent,7}  heartbeats={_net.HeartbeatsSent,4}", Counters);
             GUILayout.Label($"{_net.ServerInfoLine}  |  unknown TCP messages skipped: {_net.TcpMessagesSkipped}");
             GUILayout.Label($"prediction: unacked={_net.UnackedInputs,3}  reconciliations={_net.Reconciliations,7}  " +
@@ -214,17 +217,21 @@ namespace KnockKnockArena.Networking
         /// <summary>
         /// The netcode techniques plus the latency simulator, switchable WHILE PLAYING
         /// so one unbroken take can show what each of them is doing. The controls only
-        /// set NetworkBootstrap's fields; NetworkBootstrap pushes the latency into the
-        /// client every frame — no reconnect needed.
+        /// set NetworkBootstrap's fields; NetworkBootstrap pushes the latency and the
+        /// jitter into the client every frame — no reconnect needed.
         /// </summary>
         private void DrawTechniqueToggles()
         {
             GUILayout.BeginHorizontal();
             _net.EnablePrediction = GUILayout.Toggle(_net.EnablePrediction, "prediction", GUILayout.Width(95));
             _net.EnableReconciliation = GUILayout.Toggle(_net.EnableReconciliation, "reconciliation", GUILayout.Width(115));
+            _net.EnableInterpolation = GUILayout.Toggle(_net.EnableInterpolation, "interpolation", GUILayout.Width(110));
             GUILayout.Label($"latency {_net.SimulatedLatencyMs} ms/way", GUILayout.Width(120));
             _net.SimulatedLatencyMs = Mathf.RoundToInt(
                 GUILayout.HorizontalSlider(_net.SimulatedLatencyMs, 0f, 300f, GUILayout.Width(100)));
+            GUILayout.Label($"jitter ±{_net.SimulatedJitterMs} ms", GUILayout.Width(95));
+            _net.SimulatedJitterMs = Mathf.RoundToInt(
+                GUILayout.HorizontalSlider(_net.SimulatedJitterMs, 0f, 100f, GUILayout.Width(80)));
             GUILayout.EndHorizontal();
         }
 

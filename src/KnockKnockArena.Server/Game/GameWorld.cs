@@ -13,8 +13,9 @@ namespace KnockKnockArena.Server.Game;
 /// loop. All mutation happens under one lock; the UDP receive thread only does
 /// lock-free lookups (concurrent dictionary) and enqueues into per-player queues.
 ///
-/// Module 6: movement with the shared rule, and a snapshot to every player each tick.
-/// Pickups come in M07, shooting in M08, rockets in M09.
+/// Module 7: movement, pickups that are taken and come back, and a snapshot with every
+/// player and pickup each tick. What a pickup GIVES (health, ammo, weapons) comes in
+/// M09 with damage and death, as do rockets.
 /// </summary>
 public sealed class GameWorld
 {
@@ -43,6 +44,14 @@ public sealed class GameWorld
 
     /// <summary>Scratch list: one player's inputs for the current tick (TakeInputs).</summary>
     private readonly List<InputPacket> _inputsThisTick = new();
+    private readonly PickupSpot[] _pickups;
+
+    public GameWorld()
+    {
+        _pickups = new PickupSpot[ArenaMap.Pickups.Length];
+        for (int i = 0; i < _pickups.Length; i++)
+            _pickups[i] = new PickupSpot { PickupId = (byte)i };
+    }
 
     public uint ServerTick { get; private set; }
     public uint Sequence { get; private set; }
@@ -100,6 +109,50 @@ public sealed class GameWorld
             return true;
         }
     }
+
+    private static string Name(PlayerState player) =>
+        $"{player.Session.Username}#{player.Session.PlayerId}";
+
+    /// <summary>
+    /// Pickups: a taken spot comes back after its respawn time; an active one is taken
+    /// by the first player whose centre is within the pickup radius. Module 7: taking
+    /// only - what the pickup gives the player comes in M09.
+    /// </summary>
+    private void UpdatePickups(List<PickupTakenEvent> pickupsTaken)
+    {
+        for (int i = 0; i < _pickups.Length; i++)
+        {
+            PickupSpot spot = _pickups[i];
+            if (!spot.Active)
+            {
+                if (ServerTick >= spot.RespawnAtTick)
+                    spot.Active = true;
+                continue;
+            }
+
+            (PickupType type, float pickupX, float pickupZ) = ArenaMap.Pickups[i];
+            foreach (PlayerState player in _playersById.Values)
+            {
+                float dx = player.X - pickupX;
+                float dz = player.Z - pickupZ;
+                if (dx * dx + dz * dz > GameConstants.PickupRadius * GameConstants.PickupRadius)
+                    continue;
+
+                spot.Active = false;
+                spot.RespawnAtTick = ServerTick + (uint)(RespawnSecondsFor(type) * GameConstants.TickRate);
+                pickupsTaken.Add(new PickupTakenEvent(player.Session.PlayerId, player.Session.Username, (byte)i, type));
+                Log.Info($"Pickup: {Name(player)} took {type} (pickup {i})");
+                break; // one winner per pickup per tick
+            }
+        }
+    }
+
+    private static float RespawnSecondsFor(PickupType type) => type switch
+    {
+        PickupType.Ak47Weapon or PickupType.RocketLauncherWeapon => GameConstants.WeaponPickupRespawnSeconds,
+        PickupType.Health => GameConstants.HealthPickupRespawnSeconds,
+        _ => GameConstants.AmmoPickupRespawnSeconds,
+    };
 
     /// <summary>Called by the receive thread. False when the input is dropped; the
     /// reason says why.</summary>
@@ -164,9 +217,11 @@ public sealed class GameWorld
     /// <summary>
     /// Advances the world one tick and builds the outgoing snapshots.
     /// Snapshots are personalized: LastProcessedInputIndex belongs to the recipient.
-    /// Players whose UDP has been silent too long are returned in timedOut.
+    /// Players whose UDP has been silent too long are returned in timedOut; pickups
+    /// taken this tick in pickupsTaken (broadcast on TCP by the caller).
     /// </summary>
-    public void Tick(List<(IPEndPoint EndPoint, byte[] Datagram)> snapshotSends, List<PlayerState> timedOut)
+    public void Tick(List<(IPEndPoint EndPoint, byte[] Datagram)> snapshotSends, List<PlayerState> timedOut,
+        List<PickupTakenEvent> pickupsTaken)
     {
         lock (_gate)
         {
@@ -179,7 +234,6 @@ public sealed class GameWorld
             {
                 // TakeInputs hands out this tick's inputs by the budget rule, in index
                 // order, and acknowledges them.
-                
                 TakeInputs(player, _inputsThisTick);
                 foreach (InputPacket input in _inputsThisTick)
                 {
@@ -223,6 +277,9 @@ public sealed class GameWorld
             }
             _orphaned.Clear();
 
+            UpdatePickups(pickupsTaken);
+            
+
             if (_playersById.Count == 0)
                 return;
 
@@ -245,6 +302,17 @@ public sealed class GameWorld
                 });
             }
 
+            List<PickupEntityState> pickupEntities = new(_pickups.Length);
+            for (int i = 0; i < _pickups.Length; i++)
+            {
+                pickupEntities.Add(new PickupEntityState
+                {
+                    EntityId = (ushort)(GameConstants.PickupEntityIdBase + i),
+                    Type = ArenaMap.Pickups[i].Type,
+                    Active = _pickups[i].Active,
+                });
+            }
+
             foreach (PlayerState recipient in _playersById.Values)
             {
                 SnapshotPacket snapshot = new()
@@ -253,6 +321,8 @@ public sealed class GameWorld
                     ServerTick = ServerTick,
                     LastProcessedInputIndex = recipient.LastProcessedInputIndex,
                     Players = entities,
+                    Pickups = pickupEntities,
+                    
                 };
                 snapshotSends.Add((recipient.EndPoint, snapshot.ToDatagram()));
             }

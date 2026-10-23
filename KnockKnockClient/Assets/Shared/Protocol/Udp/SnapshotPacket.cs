@@ -3,6 +3,15 @@ using System.IO;
 
 namespace KnockKnockArena.Shared.Protocol.Udp
 {
+    /// <summary>A pickup spot. Position comes from the published map data — the
+    /// snapshot only says whether it is currently there to take.</summary>
+    public sealed class PickupEntityState
+    {
+        public ushort EntityId;
+        public PickupType Type;
+        public bool Active;
+    }
+
     /// <summary>
     /// Server -> one client. The FULL game state, sent every tick (30 Hz) to every
     /// joined player. No delta compression — a deliberate choice so every packet can
@@ -16,7 +25,8 @@ namespace KnockKnockArena.Shared.Protocol.Udp
     ///           then per entity: [entityId:ushort] [entityType:byte] [type-specific data]
     ///
     /// Player entity: see PlayerEntityState, which serializes itself (39 bytes).
-    /// Module 6: players only. Pickups join the snapshot in M07, rockets in M09.
+    /// Pickup entity: [entityId:ushort] [entityType:byte = 3] [pickupType:byte] [active:bool] (5 bytes).
+    /// Module 7: players and pickups. Rockets join the snapshot in M09.
     /// </summary>
     public sealed class SnapshotPacket
     {
@@ -29,6 +39,7 @@ namespace KnockKnockArena.Shared.Protocol.Udp
         public uint LastProcessedInputIndex;
 
         public List<PlayerEntityState> Players = new List<PlayerEntityState>();
+        public List<PickupEntityState> Pickups = new List<PickupEntityState>();
 
         public byte[] ToDatagram()
         {
@@ -37,9 +48,16 @@ namespace KnockKnockArena.Shared.Protocol.Udp
                 writer.Write(Sequence);
                 writer.Write(ServerTick);
                 writer.Write(LastProcessedInputIndex);
-                writer.Write((byte)Players.Count);
+                writer.Write((byte)(Players.Count + Pickups.Count));
                 foreach (PlayerEntityState player in Players)
                     player.WriteTo(writer);
+                foreach (PickupEntityState pickup in Pickups)
+                {
+                    writer.Write(pickup.EntityId);
+                    writer.Write((byte)EntityType.Pickup);
+                    writer.Write((byte)pickup.Type);
+                    writer.Write(pickup.Active);
+                }
             });
         }
 
@@ -63,6 +81,14 @@ namespace KnockKnockArena.Shared.Protocol.Udp
                     {
                         case EntityType.Player:
                             snapshot.Players.Add(PlayerEntityState.ReadData(reader, entityId));
+                            break;
+                        case EntityType.Pickup:
+                            snapshot.Pickups.Add(new PickupEntityState
+                            {
+                                EntityId = entityId,
+                                Type = (PickupType)reader.ReadByte(),
+                                Active = reader.ReadBoolean(),
+                            });
                             break;
                         default:
                             // Entity data has no length prefix, so an unknown type
