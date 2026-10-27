@@ -5,14 +5,17 @@ using UnityEngine;
 namespace KnockKnockArena.Networking
 {
     /// <summary>
-    /// Handed out (Moodle), module 7 after implementation 6: the dev UI — connect panel
+    /// Handed out (Moodle), module 8 after implementation 6: the dev UI — connect panel
     /// with the latency field, "Find LAN servers" and the list of servers that answered,
-    /// HUD with the UDP counters (joins, snapshots, snapshots dropped out of order,
-    /// inputs, heartbeats), the prediction line (unacked inputs, reconciliations,
-    /// bitMismatches, the first mismatch), the prediction, reconciliation and
-    /// interpolation toggles, the latency and jitter sliders and the key line, chat and
-    /// the feed (joined, left, took a pickup). It replaces the NetworkHud.cs from
-    /// implementation 4. It only reads NetworkBootstrap's public properties, sets its
+    /// HUD with the shown weapon and its ammo, the UDP counters (joins, snapshots,
+    /// snapshots dropped out of order, inputs, heartbeats), the prediction line (unacked
+    /// inputs, reconciliations, bitMismatches, the first mismatch), the prediction,
+    /// reconciliation and interpolation toggles, the latency and jitter sliders and the
+    /// key line (now with mouse fire and 1-4 weapons), chat and the feed (joined, left,
+    /// took a pickup). The crosshair and the weapon bar are not drawn here: they are the
+    /// base project's components, fed by NetworkBootstrap. The UI is unchanged since
+    /// implementation 4; it replaces the NetworkHud.cs
+    /// from implementation 4. It only reads NetworkBootstrap's public properties, sets its
     /// connect fields, SimulatedLatencyMs, SimulatedJitterMs, EnablePrediction,
     /// EnableReconciliation, EnableInterpolation and IsTyping, listens
     /// to its two events and calls its public methods; it never touches the network. Put it in Assets/Scripts/Networking next to NetworkBootstrap.
@@ -200,7 +203,9 @@ namespace KnockKnockArena.Networking
         private void DrawHud()
         {
             GUILayout.BeginArea(new Rect(20, 20, 780, 160));
-            GUILayout.Label(_net.InGame ? "In the game (UDP)" : _net.StatusLine);
+            GUILayout.Label(!_net.InGame ? _net.StatusLine
+                : !_net.HasOwnState ? "In the game (UDP)"
+                : $"In the game (UDP)  |  {_net.DisplayedWeapon} ({_net.Ammo} ammo)");
             GUILayout.Label($"UDP: joins sent={_net.JoinsSent,3}  snapshots={_net.SnapshotsAccepted,7}  " +
                             $"dropped (out of order)={_net.SnapshotsDropped,5}  " +
                             $"inputs sent={_net.InputsSent,7}  heartbeats={_net.HeartbeatsSent,4}", Counters);
@@ -208,7 +213,7 @@ namespace KnockKnockArena.Networking
             GUILayout.Label($"prediction: unacked={_net.UnackedInputs,3}  reconciliations={_net.Reconciliations,7}  " +
                             $"bitMismatches={_net.BitMismatches,4}", Counters);
             DrawTechniqueToggles();
-            GUILayout.Label("WASD move  |  Shift sprint  |  Ctrl walk  |  Space dash  |  Enter chat");
+            GUILayout.Label("WASD move  |  Shift sprint  |  Ctrl walk  |  Space dash  |  mouse fire  |  1-4 weapons  |  Enter chat");
             if (_net.FirstMismatch.Length > 0)
                 GUILayout.Label($"FIRST MISMATCH: {_net.FirstMismatch}");
             GUILayout.EndArea();

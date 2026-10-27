@@ -14,13 +14,15 @@ namespace KnockKnockArena.Networking
     /// student base project is produced by deleting the Networking folder and this
     /// object from the scene.
     ///
-    /// MODULE 7: entities and interpolation. The local player is predicted and
-    /// reconciled as in M06. Other players render a few ticks in the past, blended
-    /// between buffered snapshots in position AND aim ("you see yourself in the
-    /// present — everyone else in the past"). Pickups are entities: the scene's own
-    /// pickup objects are shown and hidden by the snapshot's Active flag. The dev UI is
+    /// MODULE 8: shooting. The fire button and weapon switches ride in the inputs;
+    /// the server decides every hit. The client draws its own shot on the click
+    /// ("favor the shooter"), mirrors the spread in the crosshair, predicts a weapon
+    /// switch, and draws other players' shots from ShotsFired, delayed like their
+    /// figures. Every input carries the tick on screen (NetworkClient.ViewTick), so
+    /// lag compensation rewinds to what the shooter saw. The dev UI is
     /// NetworkHud (handed out): it only reads the public properties below, listens to
-    /// the two events and calls the public methods. Nothing here draws anything.
+    /// the two events and calls the public methods. Nothing here draws IMGUI; the
+    /// crosshair and the weapon bar are the base project's components, fed below.
     /// </summary>
     public sealed class NetworkBootstrap : MonoBehaviour
     {
@@ -49,8 +51,24 @@ namespace KnockKnockArena.Networking
                  "snapshots. Off = jump to the newest snapshot (visible teleporting).")]
         public bool EnableInterpolation = true;
 
+        [Header("Game data")]
+        [Tooltip("weapons.json: a LOCAL copy of the server's data/weapons.json (M08). " +
+                 "Both sides read it with the same shared parser; M10 fetches it from the server.")]
+        public TextAsset WeaponTable;
+
         [Header("Gameplay couplings")]
         public CursorAim AimSource;
+
+        [Tooltip("The crosshair. Its look and feel live on the component itself; this " +
+                 "only feeds it the weapon's current spread.")]
+        public DynamicCrosshair Crosshair;
+
+        [Tooltip("The weapon bar. Fed the owned weapons and the active one every " +
+                 "frame; how it draws them is its own business.")]
+        public ActionBar ActionBar;
+
+        [Tooltip("Dash ability icon with the radial cooldown sweep. Optional.")]
+        public DashCooldownIcon DashCooldownIcon;
 
         [Tooltip("Prefab used for every player view. Its pivot must be at the FEET. " +
                  "Empty = primitive cube placeholders.")]
@@ -60,9 +78,6 @@ namespace KnockKnockArena.Networking
                  "null on disconnect. Wire your camera's SetTarget(Transform) here.")]
         public UnityEngine.Events.UnityEvent<Transform> LocalPlayerSpawned =
             new UnityEngine.Events.UnityEvent<Transform>();
-
-        [Tooltip("Dash ability icon with the radial cooldown sweep. Optional.")]
-        public DashCooldownIcon DashCooldownIcon;
 
         // The view LocalPlayerSpawned last fired for, so it fires once per spawn
         // (snapshots arrive 30 times a second; listeners must not).
@@ -90,6 +105,11 @@ namespace KnockKnockArena.Networking
         public long Reconciliations { get; private set; }
         public long BitMismatches { get; private set; }
         public string FirstMismatch { get; private set; } = "";
+
+        // The own weapon line (M08): known once the first snapshot with us in it has
+        // arrived. Ammo is the server's, for the active weapon.
+        public bool HasOwnState => _me != null;
+        public int Ammo => _me?.Ammo ?? 0;
 
         // A chat line, and a feed line (joined, left, took a pickup), ready to show.
         public event Action<string> ChatReceived;
@@ -119,6 +139,49 @@ namespace KnockKnockArena.Networking
         private double _renderTick;
         private bool _renderTickInitialized;
         private uint _latestSnapshotTick;
+
+        // Our own player entity from the newest snapshot (weapon, ammo).
+        private PlayerEntityState _me;
+
+        // Weapon switching is PREDICTED, like movement: the weapon you asked for is
+        // shown at once, and the request keeps riding along in every input until the
+        // server confirms it. Sending it in a single packet made a switch feel slow
+        // (a full round trip) and made a dropped packet lose it silently.
+        private byte? _requestedWeapon;
+        private int _weaponRequestTicks;
+
+        /// <summary>Index of the input that first carried the current request, or 0
+        /// before it has gone out. A snapshot may only confirm the request once the
+        /// server has PROCESSED that input — same rule as movement reconciliation.</summary>
+        private uint _weaponRequestInputIndex;
+
+        /// <summary>Give up re-asking after half a second: the server refuses weapons
+        /// you do not own, and without a limit a rejected request would ask forever.</summary>
+        private const int WeaponRequestTimeoutTicks = 15;
+
+        /// <summary>The weapon to SHOW: the requested one while a switch is in flight,
+        /// otherwise the server's. Everything cosmetic reads this (the HUD too), so the
+        /// swap is instant — and the server still decides what actually fires.</summary>
+        public WeaponId DisplayedWeapon =>
+            _requestedWeapon is byte requested ? (WeaponId)requested
+            : _me?.ActiveWeapon ?? WeaponId.Glock;
+
+        // Shot cosmetics ("favor the shooter"): the client MIRRORS the server's
+        // cooldown/ammo/bloom gates so tracers and the crosshair behave like the real
+        // thing — but hits are decided by the server alone.
+        private float _cosmeticBloom;
+        private int _cosmeticCooldownTicks;
+        private WeaponId _cosmeticWeapon = WeaponId.Glock;
+
+        /// <summary>Other players' shots waiting for their moment: each plays one
+        /// interpolation delay after it arrived (see <see cref="UpdateRemoteShots"/>).</summary>
+        private readonly List<(float PlayAt, ShotRecord Shot)> _pendingRemoteShots =
+            new List<(float, ShotRecord)>();
+
+        /// <summary>How long after arrival a remote shot is drawn. Remote figures are
+        /// rendered this far in the past (interpolation), so drawing the shot the
+        /// moment it arrives would fire it from where the shooter is GOING to be.</summary>
+        private static float RemoteShotDelaySeconds => InterpolationDelayTicks * GameConstants.TickDeltaTime;
 
         // Pickups: the scene's own pickup objects, in the map's pickup order.
         private readonly List<GameObject> _pickupViews = new List<GameObject>();
@@ -159,6 +222,20 @@ namespace KnockKnockArena.Networking
 
         private void Start()
         {
+            // The weapon table: a LOCAL copy of the server's data/weapons.json, read with
+            // the same shared parser. Like the arena, the two sides agree only because
+            // the two files are the same; M10 fetches both from the server.
+            if (WeaponTable != null)
+                WeaponStats.Load(WeaponStats.ParseTable(WeaponTable.text));
+            else
+                Debug.LogError($"{name}: no weapons.json assigned — copy data/weapons.json into the project " +
+                               "and drag it onto Weapon Table", this);
+            // The login menu needs the mouse: no crosshair and no weapon bar until we are in the game
+            if (Crosshair != null)
+                Crosshair.SetVisible(false);
+            if (ActionBar != null)
+                ActionBar.gameObject.SetActive(false);
+
             // The scene's ArenaMapStamp loaded the arena in Awake: bind its pickups now,
             // so they are there before anyone connects.
             if (ArenaMap.IsLoaded && !_pickupViewsCreated)
@@ -189,13 +266,17 @@ namespace KnockKnockArena.Networking
 
             if (Input.GetKeyDown(KeyCode.Space) && !IsTyping)
                 _dashQueued = true;
+            CollectWeaponSwitchKeys();
 
             if (_client.TryTakeSnapshot(out SnapshotPacket snapshot))
                 ApplySnapshot(snapshot);
 
             UpdateRemoteViews();
+            UpdateRemoteShots();
             SampleAndSendInputs();
             UpdateDashIcon();
+            UpdateCrosshair();
+            UpdateActionBar();
         }
 
         // ------------------------------------------------------------- connection
@@ -219,6 +300,15 @@ namespace KnockKnockArena.Networking
 
             _inputAccumulator = 0f;
             _predictionInitialized = false;
+            _me = null;
+            _requestedWeapon = null;
+            _pendingRemoteShots.Clear();
+            _cosmeticBloom = 0f;
+            _cosmeticCooldownTicks = 0;
+            if (Crosshair != null)
+                Crosshair.SetVisible(false);
+            if (ActionBar != null)
+                ActionBar.gameObject.SetActive(false);
             _pendingInputs.Clear();
             Reconciliations = 0;
             BitMismatches = 0;
@@ -388,8 +478,27 @@ namespace KnockKnockArena.Networking
                     _characterVisuals[player.EntityId] = view.GetComponent<CharacterVisual>();
                 }
 
+                // The weapon in the hand comes from the snapshot — the server owns who
+                // carries what. For YOURSELF the requested weapon is shown instead while
+                // a switch is in flight, so the swap is instant.
+                WeaponId shownWeapon = player.ActiveWeapon;
+                if (player.EntityId == _client.PlayerId && _requestedWeapon is byte requested)
+                {
+                    // Only a snapshot that has PROCESSED the input carrying the request
+                    // can settle it: the server has either switched, or refused.
+                    bool serverHasSeenIt = _weaponRequestInputIndex != 0 &&
+                                           snapshot.LastProcessedInputIndex >= _weaponRequestInputIndex;
+                    if (serverHasSeenIt)
+                        _requestedWeapon = null;
+                    else
+                        shownWeapon = (WeaponId)requested;
+                }
+                if (_characterVisuals.TryGetValue(player.EntityId, out CharacterVisual weaponVisual) && weaponVisual != null)
+                    weaponVisual.SetWeapon(shownWeapon);
+
                 if (player.EntityId == _client.PlayerId)
                 {
+                    _me = player;
                     Reconcile(player, snapshot.LastProcessedInputIndex);
                     // The own view renders at the PREDICTED position (per frame, in
                     // SampleAndSendInputs).
@@ -408,7 +517,6 @@ namespace KnockKnockArena.Networking
                     if (!_remoteBuffers.TryGetValue(player.EntityId, out InterpolationBuffer buffer))
                         _remoteBuffers[player.EntityId] = buffer = new InterpolationBuffer();
                     buffer.Add(snapshot.ServerTick, player.X, player.Z, player.AimX, player.AimZ);
-                    
                     _remoteDashTicks[player.EntityId] = player.DashTicksLeft;
                 }
             }
@@ -429,7 +537,6 @@ namespace KnockKnockArena.Networking
             // Steer the render clock: it should sit InterpolationDelayTicks behind
             // the newest snapshot.
             _latestSnapshotTick = snapshot.ServerTick;
-            
             if (!_renderTickInitialized)
             {
                 _renderTick = snapshot.ServerTick - InterpolationDelayTicks;
@@ -460,6 +567,10 @@ namespace KnockKnockArena.Networking
                 _renderTick = target;
             else
                 _renderTick += error * 0.05;
+
+            // The tick of the picture on screen: other players are drawn here, so this
+            // is what a shot fired now is aimed at. It rides in every input (M08).
+            _client.ViewTick = (uint)Math.Round(_renderTick);
 
             foreach (KeyValuePair<ushort, GameObject> entry in _playerViews)
             {
@@ -542,23 +653,6 @@ namespace KnockKnockArena.Networking
                 }
                 _pickupViews.Add(view);
             }
-        }
-
-        /// <summary>
-        /// Drives the dash icon off the PREDICTED dash state, the same state the movement
-        /// prediction runs on, so the sweep starts on the keypress. The cooldown counts from
-        /// dash START (the rule in MovementSimulation), so the sweep includes the dash itself.
-        /// </summary>
-        private void UpdateDashIcon()
-        {
-            if (DashCooldownIcon == null)
-                return;
-
-            bool show = _client != null && _client.InGame && _predictionInitialized;
-            DashCooldownIcon.gameObject.SetActive(show);
-            if (show)
-                DashCooldownIcon.Set(_predictedDash.CooldownTicks, GameConstants.DashCooldownTicks,
-                    GameConstants.TickRate);
         }
 
         /// <summary>Turns a player's figure toward an aim point. W moves toward the aim,
@@ -656,6 +750,27 @@ namespace KnockKnockArena.Networking
                     continue;
                 }
 
+                ButtonBits buttons = ButtonBits.None;
+                if (Input.GetMouseButton(0)) buttons |= ButtonBits.Fire;
+
+                // The request rides in EVERY input until the server confirms it, so a
+                // dropped packet costs a tick instead of the whole switch. It stops on
+                // its own once the snapshot agrees, or after the timeout if the server
+                // refuses (a weapon you do not own).
+                byte weaponId = 0;
+                if (_requestedWeapon is byte requested)
+                {
+                    if (++_weaponRequestTicks > WeaponRequestTimeoutTicks)
+                    {
+                        _requestedWeapon = null; // give up; the snapshot is the truth
+                    }
+                    else
+                    {
+                        buttons |= ButtonBits.SwitchWeapon;
+                        weaponId = requested;
+                    }
+                }
+
                 MovementBits movement = MovementBits.None;
                 if (Input.GetKey(KeyCode.W)) movement |= MovementBits.W;
                 if (Input.GetKey(KeyCode.A)) movement |= MovementBits.A;
@@ -671,7 +786,12 @@ namespace KnockKnockArena.Networking
                     ? AimSource.AimPoint
                     : Vector3.zero;
 
-                uint inputIndex = _client.SendInput(movement, aim.x, aim.z, ButtonBits.None, 0);
+                uint inputIndex = _client.SendInput(movement, aim.x, aim.z, buttons, weaponId);
+
+                // Remember which input first carried this request, so only a snapshot
+                // that has actually processed it may confirm it.
+                if ((buttons & ButtonBits.SwitchWeapon) != 0 && _weaponRequestInputIndex == 0)
+                    _weaponRequestInputIndex = inputIndex;
 
                 // Client-side prediction: apply the input locally NOW — zero perceived
                 // latency — and remember it for reconciliation replay.
@@ -683,6 +803,8 @@ namespace KnockKnockArena.Networking
                         movement, aim.x, aim.z, GameConstants.TickDeltaTime);
                     _pendingInputs.Add((inputIndex, movement, aim.x, aim.z));
                 }
+
+                TickShotCosmetics(buttons, aim);
             }
 
             // The own view follows the prediction every frame, blended between the
@@ -709,6 +831,204 @@ namespace KnockKnockArena.Networking
                         SetAim(_client.PlayerId, AimSource.AimPoint.x, AimSource.AimPoint.z);
                 }
             }
+        }
+
+        // ------------------------------------------------------------- shooting
+
+        private void CollectWeaponSwitchKeys()
+        {
+            if (IsTyping)
+                return; // typing "1v1?" in chat must not switch weapons
+
+            // GetKeyDown must be read every frame (not inside the fixed-rate loop).
+            if (Input.GetKeyDown(KeyCode.Alpha1)) RequestWeapon(WeaponId.Punch);
+            if (Input.GetKeyDown(KeyCode.Alpha2)) RequestWeapon(WeaponId.Glock);
+            if (Input.GetKeyDown(KeyCode.Alpha3)) RequestWeapon(WeaponId.Ak47);
+            if (Input.GetKeyDown(KeyCode.Alpha4)) RequestWeapon(WeaponId.RocketLauncher);
+        }
+
+        /// <summary>Asks for a weapon and shows it straight away. The request is always
+        /// recorded, even for the weapon already held: an earlier request may still be
+        /// travelling, and dropping this one would let the older one win.</summary>
+        private void RequestWeapon(WeaponId weapon)
+        {
+            // Never predict a switch the server will refuse: the client knows which
+            // weapons it owns (the bitfield from M01, in every snapshot).
+            if (_me != null && (_me.OwnedWeapons & 1 << (int)weapon) == 0)
+                return;
+
+            _requestedWeapon = (byte)weapon;
+            _weaponRequestTicks = 0;
+            _weaponRequestInputIndex = 0; // stamped when it first goes out
+
+            if (_client != null &&
+                _characterVisuals.TryGetValue(_client.PlayerId, out CharacterVisual ownVisual) &&
+                ownVisual != null)
+            {
+                ownVisual.SetWeapon(weapon);
+            }
+        }
+
+        /// <summary>
+        /// Runs once per sampled input tick: mirrors the server's fire gates (cooldown,
+        /// dead zone, ammo) and bloom, and draws our own shot on the click — favor the
+        /// shooter. The hit is decided by the server alone; this is the picture of it.
+        /// </summary>
+        private void TickShotCosmetics(ButtonBits buttons, Vector3 aim)
+        {
+            if (_me == null)
+                return;
+
+            // Follows the DISPLAYED weapon, so the crosshair resizes with the switch
+            // instead of a round trip behind it.
+            if (DisplayedWeapon != _cosmeticWeapon)
+            {
+                _cosmeticWeapon = DisplayedWeapon;
+                _cosmeticBloom = 0f; // bloom does not carry across weapons (server rule)
+                _cosmeticCooldownTicks = 0;
+            }
+
+            _cosmeticBloom = SpreadModel.Decay(_cosmeticWeapon, _cosmeticBloom, GameConstants.TickDeltaTime);
+            if (_cosmeticCooldownTicks > 0)
+                _cosmeticCooldownTicks--;
+
+            if ((buttons & ButtonBits.Fire) == 0 || _cosmeticCooldownTicks > 0)
+                return;
+
+            WeaponStats stats = WeaponStats.For(_cosmeticWeapon);
+            // Module 8: firearms. The punch comes in M09, and so does the rocket.
+            if (stats.IsMelee || _cosmeticWeapon == WeaponId.RocketLauncher)
+                return;
+
+            float directionX = aim.x - _predictedX;
+            float directionZ = aim.z - _predictedZ;
+            if (Mathf.Sqrt(directionX * directionX + directionZ * directionZ) < GameConstants.DeadZoneMeters)
+                return; // the server would reject this shot (dead zone)
+            if (_me.Ammo == 0)
+                return; // the server would reject this shot (no ammo)
+
+            _cosmeticCooldownTicks = Mathf.CeilToInt(stats.CooldownSeconds * GameConstants.TickRate);
+            _cosmeticBloom = SpreadModel.OnShot(_cosmeticWeapon, _cosmeticBloom);
+
+            // Kick the weapon hand. Recovery takes exactly one fire interval.
+            Vector3 from = new Vector3(_predictedX, EntityY, _predictedZ);
+            WeaponGrip grip = null;
+            if (_characterVisuals.TryGetValue(_client.PlayerId, out CharacterVisual shooterVisual) &&
+                shooterVisual != null)
+            {
+                shooterVisual.ApplyRecoil(stats.CooldownSeconds);
+                if (shooterVisual.TryGetMuzzle(out Vector3 muzzle))
+                    from = muzzle;
+                grip = shooterVisual.HeldWeaponGrip;
+            }
+            if (grip != null)
+                SpatialAudio.Play(grip.FireSounds, from, grip.FireVolume);
+
+            // The cosmetic shot runs FROM THE BARREL TO WHAT THE CURSOR IS ON and stops
+            // at the first thing the physics scene says is in the way. Deliberately
+            // WITHOUT a spread roll: the server owns the randomness.
+            Vector3 shot = aim - from;
+            if (shot.sqrMagnitude < 0.0001f)
+                return;
+            Vector3 to = aim;
+            if (Physics.Raycast(from, shot.normalized, out RaycastHit cosmeticHit,
+                    shot.magnitude, ~0, QueryTriggerInteraction.Ignore))
+                to = cosmeticHit.point;
+
+            if (grip != null && grip.ProjectilePrefab != null)
+                BulletVisual.Spawn(grip.ProjectilePrefab, from, to, grip.ProjectileSpeed, grip.HitEffectPrefab);
+            else
+                TracerEffect.Spawn(from, to);
+        }
+
+        /// <summary>
+        /// Draws what other players fire, from the server's ShotsFired: the hand kicks,
+        /// and the round flies from the shooter's barrel to where the server says the
+        /// shot ended. Our own shots are skipped — they were drawn on the click.
+        /// </summary>
+        private void UpdateRemoteShots()
+        {
+            while (_client.ShotEvents.TryDequeue(out ShotsFiredPacket packet))
+            {
+                foreach (ShotRecord shot in packet.Shots)
+                    if (shot.ShooterId != _client.PlayerId)
+                        _pendingRemoteShots.Add((Time.time + RemoteShotDelaySeconds, shot));
+            }
+
+            for (int i = _pendingRemoteShots.Count - 1; i >= 0; i--)
+            {
+                if (Time.time < _pendingRemoteShots[i].PlayAt)
+                    continue;
+                PlayRemoteShot(_pendingRemoteShots[i].Shot);
+                _pendingRemoteShots.RemoveAt(i);
+            }
+        }
+
+        private void PlayRemoteShot(ShotRecord shot)
+        {
+            if (!_characterVisuals.TryGetValue(shot.ShooterId, out CharacterVisual visual) || visual == null)
+                return; // shooter not (or no longer) in view
+
+            WeaponStats stats = WeaponStats.For(shot.Weapon);
+            visual.ApplyRecoil(stats.CooldownSeconds);
+
+            Vector3 from = new Vector3(visual.transform.position.x, EntityY, visual.transform.position.z);
+            if (visual.TryGetMuzzle(out Vector3 muzzle))
+                from = muzzle;
+            WeaponGrip grip = visual.HeldWeaponGrip;
+            if (grip != null)
+                SpatialAudio.Play(grip.FireSounds, from, grip.FireVolume);
+
+            // The server is XZ-only: the round flies level from the barrel to the end
+            // point, which already stops where the server decided — on the player it
+            // hit, else at the wall.
+            Vector3 to = new Vector3(shot.EndX, from.y, shot.EndZ);
+            if ((to - from).sqrMagnitude < 0.0001f)
+                return;
+            if (grip != null && grip.ProjectilePrefab != null)
+                BulletVisual.Spawn(grip.ProjectilePrefab, from, to, grip.ProjectileSpeed,
+                    shot.HitPlayer ? null : grip.HitEffectPrefab);
+            else
+                TracerEffect.Spawn(from, to);
+        }
+
+        /// <summary>The dash icon: shown while in the game, its sweep from the predicted dash state, so it starts
+        /// at the dash START (the rule in MovementSimulation), so the sweep includes the dash itself.
+        /// </summary>
+        private void UpdateDashIcon()
+        {
+            if (DashCooldownIcon == null)
+                return;
+
+            bool show = _client != null && _client.InGame && _predictionInitialized;
+            DashCooldownIcon.gameObject.SetActive(show);
+            if (show)
+                DashCooldownIcon.Set(_predictedDash.CooldownTicks, GameConstants.DashCooldownTicks,
+                    GameConstants.TickRate);
+        }
+
+        /// <summary>Feeds the crosshair the weapon's accumulated bloom — the same number
+        /// the server rolls its spread inside.</summary>
+        private void UpdateCrosshair()
+        {
+            if (Crosshair == null)
+                return;
+            bool visible = _client != null && _client.InGame && _me != null;
+            Crosshair.SetVisible(visible);
+            if (visible)
+                Crosshair.SetSpread(_cosmeticBloom);
+        }
+
+        /// <summary>Hands the weapon bar the server's picture of your arsenal; the
+        /// PREDICTED weapon decides which slot is lit.</summary>
+        private void UpdateActionBar()
+        {
+            if (ActionBar == null)
+                return;
+            bool show = _client != null && _client.InGame && _me != null;
+            ActionBar.gameObject.SetActive(show);
+            if (show)
+                ActionBar.Refresh(_me.OwnedWeapons, DisplayedWeapon);
         }
     }
 }

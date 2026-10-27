@@ -13,9 +13,10 @@ namespace KnockKnockArena.Server.Game;
 /// loop. All mutation happens under one lock; the UDP receive thread only does
 /// lock-free lookups (concurrent dictionary) and enqueues into per-player queues.
 ///
-/// Module 7: movement, pickups that are taken and come back, and a snapshot with every
-/// player and pickup each tick. What a pickup GIVES (health, ammo, weapons) comes in
-/// M09 with damage and death, as do rockets.
+/// Module 8: shooting. Weapon switches and shots ride in the inputs; a shot is judged
+/// with lag compensation (rewind) and in the present, both are logged, and every shot
+/// goes out to the others in a ShotsFired datagram. What a hit DOES (damage, death) and
+/// what a pickup gives come in M09, as do the punch and the rocket.
 /// </summary>
 public sealed class GameWorld
 {
@@ -36,6 +37,24 @@ public sealed class GameWorld
     private const int MaxGapWaitTicks = 3;
 
     private readonly object _gate = new();
+    private readonly Random _random = new();
+
+    /// <summary>Every shot resolved this tick, hit or miss, broadcast to all clients
+    /// in one ShotsFired datagram after the snapshots — so other players' shots are
+    /// visible, not only their consequences.</summary>
+    private readonly List<ShotRecord> _shotsThisTick = new();
+
+    private volatile bool _rewindEnabled = true;
+
+    /// <summary>Lag compensation on or off — the server console's "rewind on" and
+    /// "rewind off". Off judges every shot against where the targets are NOW. Both
+    /// judgements are logged either way, so the difference is in the log whatever the
+    /// setting.</summary>
+    public bool RewindEnabled
+    {
+        get => _rewindEnabled;
+        set => _rewindEnabled = value;
+    }
     private readonly Dictionary<byte, PlayerState> _playersById = new();
     private readonly ConcurrentDictionary<IPEndPoint, PlayerState> _playersByEndPoint = new();
 
@@ -112,6 +131,174 @@ public sealed class GameWorld
 
     private static string Name(PlayerState player) =>
         $"{player.Session.Username}#{player.Session.PlayerId}";
+
+    /// <summary>
+    /// Switches the active weapon — server-authoritative: the weapon must be owned
+    /// (its bit set in the ownership bitfield), anything else is ignored. A client
+    /// that sends unowned weapon ids is buggy or cheating, so it is worth a warning.
+    /// </summary>
+    private static void TrySwitchWeapon(PlayerState player, byte weaponId)
+    {
+        if (weaponId > (byte)WeaponId.RocketLauncher)
+        {
+            Log.Warn($"REJECT weapon switch from {player.Session.Username}#{player.Session.PlayerId}: " +
+                     $"unknown weapon {weaponId}");
+            return;
+        }
+        if ((player.OwnedWeapons & 1 << weaponId) == 0)
+        {
+            Log.Warn($"REJECT weapon switch from {player.Session.Username}#{player.Session.PlayerId}: " +
+                     $"weapon {(WeaponId)weaponId} not owned");
+            return;
+        }
+        player.ActiveWeapon = (WeaponId)weaponId;
+        player.SpreadBloom = 0f; // bloom does not carry across weapons
+    }
+
+    private void TryFire(PlayerState shooter, InputPacket input)
+    {
+        // Still cooling down: normal when the fire button is held, not an error.
+        if (ServerTick < shooter.NextFireAllowedTick)
+            return;
+
+        WeaponStats stats = WeaponStats.For(shooter.ActiveWeapon);
+
+        // Module 8: firearms. The punch comes in M09 (an arc instead of a ray), and the
+        // rocket launcher cannot be picked up before M09.
+        if (stats.IsMelee || shooter.ActiveWeapon == WeaponId.RocketLauncher)
+            return;
+
+        if (shooter.Ammo[(int)shooter.ActiveWeapon] == 0)
+        {
+            Log.Packet($"REJECT fire from {Name(shooter)}: no ammo");
+            return;
+        }
+
+        // The server derives the shot direction itself: the player's centre toward the
+        // aim point. Aim points inside the dead zone give a meaningless direction and
+        // are rejected (S01 2.2).
+        float directionX = input.AimX - shooter.X;
+        float directionZ = input.AimZ - shooter.Z;
+        float aimDistance = MathF.Sqrt(directionX * directionX + directionZ * directionZ);
+        if (aimDistance < GameConstants.DeadZoneMeters)
+        {
+            Log.Packet($"REJECT fire from {Name(shooter)}: behind check failed (aim point in dead zone)");
+            return;
+        }
+        directionX /= aimDistance;
+        directionZ /= aimDistance;
+
+        shooter.NextFireAllowedTick = ServerTick + (uint)MathF.Ceiling(stats.CooldownSeconds * GameConstants.TickRate);
+
+        // Lag compensation: judge the shot at the tick the shooter SAW (the tick of
+        // the picture they aimed at), clamped to the history buffer.
+        uint rewindTick = ClampRewindTick(input.Tick);
+        FireHitscan(shooter, directionX, directionZ, rewindTick);
+    }
+
+    private uint ClampRewindTick(uint clientTick)
+    {
+        if (clientTick > ServerTick)
+            return ServerTick;
+        uint oldest = ServerTick >= GameConstants.RewindBufferTicks - 1
+            ? ServerTick - (uint)(GameConstants.RewindBufferTicks - 1)
+            : 0;
+        return clientTick < oldest ? oldest : clientTick;
+    }
+
+    private void FireHitscan(PlayerState shooter, float directionX, float directionZ, uint rewindTick)
+    {
+        shooter.Ammo[(int)shooter.ActiveWeapon]--;
+
+        // Server-authoritative spread: the server rolls the deviation and owns the
+        // bloom. The client only mirrors the bloom value for its crosshair.
+        float spreadDeg = SpreadModel.CurrentSpreadDeg(shooter.ActiveWeapon, shooter.SpreadBloom);
+        shooter.SpreadBloom = SpreadModel.OnShot(shooter.ActiveWeapon, shooter.SpreadBloom);
+        float deviationRad = (float)(_random.NextDouble() * 2.0 - 1.0) * spreadDeg * (MathF.PI / 180f);
+        float cos = MathF.Cos(deviationRad);
+        float sin = MathF.Sin(deviationRad);
+        float shotX = directionX * cos - directionZ * sin;
+        float shotZ = directionX * sin + directionZ * cos;
+
+        // Geometry blocks hitscan: the nearest wall along the ray caps the range.
+        float wallDistance = float.PositiveInfinity;
+        foreach (Aabb wall in ArenaMap.Walls)
+        {
+            if (Raycast.RayIntersectsAabb(shooter.X, shooter.Z, shotX, shotZ,
+                    wall.MinX, wall.MinZ, wall.MaxX, wall.MaxZ, out float t) && t < wallDistance)
+                wallDistance = t;
+        }
+
+        // Judged twice: against where the targets were at the tick the shooter saw
+        // (rewind), and against where they are now (present). The setting decides
+        // which one counts; the log always shows both.
+        PlayerState? rewound = FindVictim(shooter, shotX, shotZ, wallDistance, rewindTick,
+            out float rewoundDistance, out float rewoundOffCentre);
+        PlayerState? present = FindVictim(shooter, shotX, shotZ, wallDistance, null,
+            out float presentDistance, out float presentOffCentre);
+        bool rewind = RewindEnabled;
+        PlayerState? victim = rewind ? rewound : present;
+        float victimDistance = rewind ? rewoundDistance : presentDistance;
+        Log.Info($"Shot: {Name(shooter)} {shooter.ActiveWeapon}, rewind: {Verdict(rewound, rewoundOffCentre)} · present: {Verdict(present, presentOffCentre)} · " +
+                 (rewind ? $"judged by rewind (tick {rewindTick}, {ServerTick - rewindTick} ticks back)" : "judged in the present"));
+        // Module 8 stops at the verdict: what a hit DOES (damage, death) comes in M09.
+
+        // What everyone else draws: the shot to where it actually ended — the entry
+        // point into the victim, else the first wall or the arena edge.
+        float endDistance = victim != null
+            ? victimDistance
+            : Raycast.ArenaHitDistance(shooter.X, shooter.Z, shotX, shotZ);
+        RecordShot(shooter, shooter.ActiveWeapon,
+            (float)(shooter.X + (float)(shotX * endDistance)),
+            (float)(shooter.Z + (float)(shotZ * endDistance)),
+            victim != null);
+    }
+
+    /// <summary>The nearest player the ray enters before the first wall — at a past
+    /// tick (rewind), or where they stand now (atTick null).</summary>
+    private PlayerState? FindVictim(PlayerState shooter, float shotX, float shotZ, float wallDistance,
+        uint? atTick, out float distance, out float offCentre)
+    {
+        PlayerState? victim = null;
+        distance = float.PositiveInfinity;
+        offCentre = 0f;
+        foreach (PlayerState other in _playersById.Values)
+        {
+            if (other == shooter)
+                continue;
+
+            (float targetX, float targetZ) = atTick is uint tick ? other.GetPositionAt(tick) : (other.X, other.Z);
+            const float half = ArenaMap.PlayerHalfExtent;
+            if (Raycast.RayIntersectsAabb(shooter.X, shooter.Z, shotX, shotZ,
+                    targetX - half, targetZ - half, targetX + half, targetZ + half, out float t) &&
+                t < distance && t < wallDistance)
+            {
+                victim = other;
+                distance = t;
+                // How far the ray passed from the target's centre (the shot direction
+                // is a unit vector, so the cross product is the perpendicular distance).
+                offCentre = MathF.Abs((targetX - shooter.X) * shotZ - (targetZ - shooter.Z) * shotX);
+            }
+        }
+        return victim;
+    }
+
+    private static string Verdict(PlayerState? victim, float offCentre) =>
+        victim == null ? "miss" : $"hit {Name(victim)} ({offCentre:0.00} m from centre)";
+
+    private void RecordShot(PlayerState shooter, WeaponId weapon, float endX, float endZ, bool hitPlayer)
+    {
+        if (_shotsThisTick.Count >= ShotsFiredPacket.MaxShots)
+            return; // never reached in practice; the packet's count is one byte
+        _shotsThisTick.Add(new ShotRecord
+        {
+            ShooterId = shooter.Session.PlayerId,
+            Weapon = weapon,
+            EndX = endX,
+            EndZ = endZ,
+            HitPlayer = hitPlayer,
+        });
+    }
 
     /// <summary>
     /// Pickups: a taken spot comes back after its respawn time; an active one is taken
@@ -225,6 +412,8 @@ public sealed class GameWorld
     {
         lock (_gate)
         {
+            _shotsThisTick.Clear();
+
             ServerTick++;
             Sequence++;
 
@@ -249,7 +438,18 @@ public sealed class GameWorld
                     player.Dash = dash;
                     player.AimX = input.AimX;
                     player.AimZ = input.AimZ;
+
+                    if ((input.Buttons & ButtonBits.SwitchWeapon) != 0)
+                        TrySwitchWeapon(player, input.WeaponId);
+
+                    if ((input.Buttons & ButtonBits.Fire) != 0)
+                        TryFire(player, input);
                 }
+
+                player.SpreadBloom = SpreadModel.Decay(player.ActiveWeapon, player.SpreadBloom, GameConstants.TickDeltaTime);
+
+                // Record AFTER movement so the history holds this tick's final position.
+                player.RecordHistory(ServerTick);
 
                 // A timed-out player is reported ONCE and left in the world: the caller
                 // kicks the TCP connection, and the ordinary disconnect path despawns
@@ -278,7 +478,6 @@ public sealed class GameWorld
             _orphaned.Clear();
 
             UpdatePickups(pickupsTaken);
-            
 
             if (_playersById.Count == 0)
                 return;
@@ -294,6 +493,9 @@ public sealed class GameWorld
                     AimX = player.AimX,
                     AimZ = player.AimZ,
                     Health = GameConstants.MaxHealth, // no damage before M09
+                    ActiveWeapon = player.ActiveWeapon,
+                    OwnedWeapons = player.OwnedWeapons,
+                    Ammo = player.Ammo[(int)player.ActiveWeapon],
                     State = PlayerLifeState.Alive,
                     DashTicksLeft = player.Dash.TicksLeft,
                     DashCooldownTicks = player.Dash.CooldownTicks,
@@ -313,6 +515,18 @@ public sealed class GameWorld
                 });
             }
 
+            // The tick's shots go out once, to everyone (the shooter's client skips its
+            // own — it drew them on the keypress already).
+            byte[]? shotsDatagram = null;
+            if (_shotsThisTick.Count > 0)
+            {
+                shotsDatagram = new ShotsFiredPacket
+                {
+                    ServerTick = ServerTick,
+                    Shots = new List<ShotRecord>(_shotsThisTick),
+                }.ToDatagram();
+            }
+
             foreach (PlayerState recipient in _playersById.Values)
             {
                 SnapshotPacket snapshot = new()
@@ -322,9 +536,10 @@ public sealed class GameWorld
                     LastProcessedInputIndex = recipient.LastProcessedInputIndex,
                     Players = entities,
                     Pickups = pickupEntities,
-                    
                 };
                 snapshotSends.Add((recipient.EndPoint, snapshot.ToDatagram()));
+                if (shotsDatagram != null)
+                    snapshotSends.Add((recipient.EndPoint, shotsDatagram));
             }
         }
     }

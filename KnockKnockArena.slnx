@@ -23,5 +23,6 @@
     <Project Path="tests/KnockKnockArena.Tests.M05/KnockKnockArena.Tests.M05.csproj" />
     <Project Path="tests/KnockKnockArena.Tests.M06/KnockKnockArena.Tests.M06.csproj" />
     <Project Path="tests/KnockKnockArena.Tests.M07/KnockKnockArena.Tests.M07.csproj" />
+    <Project Path="tests/KnockKnockArena.Tests.M08/KnockKnockArena.Tests.M08.csproj" />
   </Folder>
 </Solution>

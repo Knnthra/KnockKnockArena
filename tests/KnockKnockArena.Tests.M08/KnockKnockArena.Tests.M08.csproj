@@ -1,0 +1,40 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Module 8 tests: the shooting code both sides share - Raycast, ShotsFiredPacket byte for
+    byte, the weapon table (weapons.json) and the spread model.
+    Handed out to the students; they run it against THEIR OWN Shared project:
+
+      dotnet test tests/KnockKnockArena.Tests.M08
+
+    See README.md next to this file.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.4" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+  <!-- The code under test: YOUR shared project. The test project sits in tests/ next to
+       src/, so this relative path works in your repo exactly as it does here. -->
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\KnockKnockArena.Shared\KnockKnockArena.Shared.csproj" />
+  </ItemGroup>
+
+  <!-- The answer key's weapon table, next to the test dll. -->
+  <ItemGroup>
+    <None Include="weapons.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>

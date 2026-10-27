@@ -1,0 +1,68 @@
+{
+  "_comment": [
+    "The weapon table. Entries must be in WeaponId order (Punch, Glock, Ak47,",
+    "RocketLauncher) and named, so a file that drifts out of step with the protocol",
+    "says so at load instead of quietly mixing weapons up.",
+    "",
+    "Damage, cooldown, priority and the spread model are HAND-AUTHORED balance -",
+    "edit them here. The muzzle fields are MEASURED: run",
+    "KnockKnock > Export Weapon Muzzles to weapons.json and it rewrites this file,",
+    "keeping your balance edits and replacing only those two numbers per weapon.",
+    "",
+    "Spread bloom (firearms): current spread = baseSpreadDeg + bloom, where bloom",
+    "grows by spreadPerShotDeg per shot, is capped at maxSpreadDeg, and recovers at",
+    "spreadRecoveryDegPerSec. Melee weapons use meleeRangeMeters and meleeArcDeg.",
+    "",
+    "muzzleForwardMeters/muzzleRightMeters place a PROJECTILE weapon's muzzle",
+    "relative to the player's centre, in the player's own frame. The sideways one",
+    "matters: the weapon is held in a hand, off to one side, so a rocket fired from",
+    "the centre appears beside the barrel. Hitscan weapons do not need them - those",
+    "are judged from the centre and only drawn from the barrel."
+  ],
+
+  "weapons": [
+    {
+      "id": "Punch",
+      "melee": true,
+      "damage": 5,
+      "cooldownSeconds": 0.6,
+      "priority": 0,
+      "meleeRangeMeters": 1.8,
+      "meleeArcDeg": 90.0
+    },
+    {
+      "id": "Glock",
+      "melee": false,
+      "damage": 10,
+      "cooldownSeconds": 0.35,
+      "priority": 1,
+      "baseSpreadDeg": 1.0,
+      "spreadPerShotDeg": 0.8,
+      "maxSpreadDeg": 4.0,
+      "spreadRecoveryDegPerSec": 6.0
+    },
+    {
+      "id": "Ak47",
+      "melee": false,
+      "damage": 12,
+      "cooldownSeconds": 0.15,
+      "priority": 2,
+      "baseSpreadDeg": 1.5,
+      "spreadPerShotDeg": 1.2,
+      "maxSpreadDeg": 10.0,
+      "spreadRecoveryDegPerSec": 4.0,
+      "muzzleForwardMeters": 4.07,
+      "muzzleRightMeters": 1.54
+    },
+    {
+      "id": "RocketLauncher",
+      "melee": false,
+      "damage": 100,
+      "cooldownSeconds": 1.2,
+      "priority": 3,
+      "projectileSpeed": 30,
+      "muzzleForwardMeters": 2.34,
+      "muzzleRightMeters": 1.54
+    }
+  ]
+}

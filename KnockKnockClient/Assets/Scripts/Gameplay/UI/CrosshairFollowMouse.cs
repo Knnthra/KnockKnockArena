@@ -64,7 +64,9 @@ public class CrosshairFollowMouse : MonoBehaviour
         }
 
         // Hide crosshair when hovering over UI elements, show system cursor instead
-        bool overUI = EventSystem.current != null && EventSystem.current.IsPointerOverGameObject();
+        // ... and over the settings menu (F1), which is IMGUI and invisible to the EventSystem
+        bool overUI = KnockKnockArena.Gameplay.GameMenu.Open ||
+                      (EventSystem.current != null && EventSystem.current.IsPointerOverGameObject());
         canvasGroup.alpha = overUI ? 0f : 1f;
         Cursor.visible = overUI;
 

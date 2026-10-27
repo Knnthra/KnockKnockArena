@@ -167,11 +167,11 @@ MonoBehaviour:
   _landingVolume: 1
   _punchSwingSounds:
   - {fileID: 8300000, guid: ddb9b3f02fa06324c8295a72fa60bd3a, type: 3}
-  _punchSwingVolume: 10
+  _punchSwingVolume: 0.2
   _punchHitSounds:
   - {fileID: 8300000, guid: b7c61e3f75b21d940bf101a97248060a, type: 3}
   - {fileID: 8300000, guid: 247b8e926602e454c8fd547c1bd9c8d6, type: 3}
-  _punchHitVolume: 10
+  _punchHitVolume: 0.3
 --- !u!1 &4960060257966541485
 GameObject:
   m_ObjectHideFlags: 0

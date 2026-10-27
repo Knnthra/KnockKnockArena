@@ -5,7 +5,7 @@ namespace KnockKnockArena.Server;
 /// <summary>
 /// Server configuration, from command-line arguments:
 ///
-///   args: --port N, --max-players N, --name TEXT, --map PATH, --verbose
+///   args: --port N, --max-players N, --name TEXT, --map PATH, --weapons PATH, --verbose
 /// </summary>
 public sealed class ServerConfig
 {
@@ -21,6 +21,9 @@ public sealed class ServerConfig
     /// <summary>The arena file (M06): a LOCAL file, read at startup. The client has its
     /// own copy in the Unity project — the two only agree because they are the same file.</summary>
     public string MapPath { get; private set; } = "data/arena.json";
+
+    /// <summary>The weapon table (M08): damage, cooldown, spread - balance as data.</summary>
+    public string WeaponsPath { get; private set; } = "data/weapons.json";
 
     public bool Verbose { get; private set; }
 
@@ -48,12 +51,16 @@ public sealed class ServerConfig
                     config.MapPath = args[i + 1];
                     i++;
                     break;
+                case "--weapons" when i + 1 < args.Length:
+                    config.WeaponsPath = args[i + 1];
+                    i++;
+                    break;
                 case "--verbose":
                     config.Verbose = true;
                     break;
                 default:
                     throw new ArgumentException($"Unknown argument '{args[i]}'. " +
-                        "Usage: --port N --max-players N --name TEXT --map PATH --verbose");
+                        "Usage: --port N --max-players N --name TEXT --map PATH --weapons PATH --verbose");
             }
         }
 

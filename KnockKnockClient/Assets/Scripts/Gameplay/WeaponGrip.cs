@@ -53,6 +53,19 @@ namespace KnockKnockArena.Gameplay
         [Range(0f, 10f)] public float ImpactVolume = 1f;
 
         /// <summary>World position shots appear to come from.</summary>
+        // Every weapon's fire and impact sounds, so SpatialAudio knows a weapon sound when it plays one
+        // and the settings menu's "Weapons" switch reaches it, whoever plays it (SoundKind.Weapon).
+        private static readonly System.Collections.Generic.HashSet<AudioClip> WeaponSounds =
+            new System.Collections.Generic.HashSet<AudioClip>();
+
+        public static bool IsWeaponSound(AudioClip clip) => clip != null && WeaponSounds.Contains(clip);
+
+        private void Awake()
+        {
+            foreach (AudioClip clip in FireSounds ?? new AudioClip[0]) if (clip != null) WeaponSounds.Add(clip);
+            foreach (AudioClip clip in ImpactSounds ?? new AudioClip[0]) if (clip != null) WeaponSounds.Add(clip);
+        }
+
         public Vector3 MuzzleWorldPosition
         {
             get

@@ -10,7 +10,8 @@ namespace KnockKnockArena.Server.Game;
 /// <summary>
 /// Server-side state for one player that has joined the game world via UDP.
 /// Inputs are enqueued by the UDP receive thread and consumed by the tick thread.
-/// Module 6: position, aim and dash. Weapons come in M08, health in M09.
+/// Module 8: position, aim, dash, weapons, ammo, spread, and the position history
+/// lag compensation rewinds into. Health comes in M09.
 /// </summary>
 public sealed class PlayerState
 {
@@ -23,6 +24,8 @@ public sealed class PlayerState
     public float Z;
     public float AimX;
     public float AimZ;
+    public WeaponId ActiveWeapon = WeaponId.Glock;
+    public byte OwnedWeapons = (1 << (int)WeaponId.Punch) | (1 << (int)WeaponId.Glock);
 
     /// <summary>Dash simulation state (shared rule) — carried in every snapshot so
     /// the owning client can seed prediction replay from it.</summary>
@@ -55,9 +58,48 @@ public sealed class PlayerState
     public DateTime LastInputRejectWarningUtc;
     public int InputRejectsSinceWarning;
 
+    /// <summary>Ammo per weapon id. Melee slots stay 0 (never consumed).</summary>
+    public readonly ushort[] Ammo = new ushort[WeaponStats.WeaponCount];
+
+    /// <summary>Accumulated spread bloom in degrees on top of the active weapon's base spread.</summary>
+    public float SpreadBloom;
+
+    /// <summary>The first server tick the player may fire again (cooldown gate).</summary>
+    public uint NextFireAllowedTick;
+
+    // Position history for lag compensation: a ring buffer with one slot per tick,
+    // covering the last RewindBufferTicks ticks (1 second).
+    private readonly uint[] _historyTick = new uint[GameConstants.RewindBufferTicks];
+    private readonly float[] _historyX = new float[GameConstants.RewindBufferTicks];
+    private readonly float[] _historyZ = new float[GameConstants.RewindBufferTicks];
+
     public PlayerState(PlayerSession session, IPEndPoint endPoint)
     {
         Session = session;
         EndPoint = endPoint;
+        Ammo[(int)WeaponId.Glock] = GameConstants.GlockStartAmmo;
+    }
+
+    /// <summary>Called once per tick after this player's movement is resolved.</summary>
+    public void RecordHistory(uint tick)
+    {
+        int slot = (int)(tick % GameConstants.RewindBufferTicks);
+        _historyTick[slot] = tick;
+        _historyX[slot] = X;
+        _historyZ[slot] = Z;
+    }
+
+    /// <summary>
+    /// Position at a past tick, for lag compensation. Falls back to the current
+    /// position when the tick is outside the buffer (too old, or not recorded yet
+    /// right after spawn) — a shot is then judged against the present, which is the
+    /// safe default.
+    /// </summary>
+    public (float X, float Z) GetPositionAt(uint tick)
+    {
+        int slot = (int)(tick % GameConstants.RewindBufferTicks);
+        if (_historyTick[slot] == tick)
+            return (_historyX[slot], _historyZ[slot]);
+        return (X, Z);
     }
 }

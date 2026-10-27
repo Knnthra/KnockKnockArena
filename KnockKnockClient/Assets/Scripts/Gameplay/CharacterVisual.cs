@@ -87,6 +87,13 @@ namespace KnockKnockArena.Gameplay
         // State pushed from the outside (see SetMotionState / SetAimPoint).
         private bool _isMoving;
         private bool _isSprinting;
+
+        // Walking (Ctrl) glides: no hops, so no landing dust or footsteps, below this speed.
+        // Measured from how fast the root moves, so it works for every player without the
+        // network code saying "walking". Between WalkSpeed (3 m/s) and MoveSpeed (6 m/s).
+        private const float GlideBelowSpeed = 4.5f;
+        private Vector3 _lastPosition;
+        private float _groundSpeed;
         private bool _isDashing;
         private Vector3? _aimPoint;
 
@@ -258,6 +265,7 @@ namespace KnockKnockArena.Gameplay
         private void Update()
         {
             UpdateRotation();
+            UpdateGroundSpeed();
 
             if (_isDashing)
                 UpdateDashArc();
@@ -285,6 +293,21 @@ namespace KnockKnockArena.Gameplay
                 transform.rotation = Quaternion.Slerp(
                     transform.rotation, targetRotation, _rotationSpeed * Time.deltaTime);
             }
+        }
+
+        // Horizontal speed of the root, smoothed so one uneven frame does not decide it.
+        private void UpdateGroundSpeed()
+        {
+            Vector3 position = transform.position;
+            if (Time.deltaTime > 0f)
+            {
+                Vector3 moved = position - _lastPosition;
+                moved.y = 0f;
+                float speed = moved.magnitude / Time.deltaTime;
+                if (speed < 50f)   // a teleport (spawn, respawn) is not a speed
+                    _groundSpeed = Mathf.Lerp(_groundSpeed, speed, 10f * Time.deltaTime);
+            }
+            _lastPosition = position;
         }
 
         private void UpdateDashArc()
@@ -318,7 +341,7 @@ namespace KnockKnockArena.Gameplay
         {
             _hopTimer -= Time.deltaTime;
 
-            bool hopMoving = _isMoving;
+            bool hopMoving = _isMoving && _groundSpeed >= GlideBelowSpeed;
             if (hopMoving && !_isHopping && _hopTimer <= 0f)
             {
                 float arcTime = _isSprinting ? _sprintHopCooldown : _hopCooldown;
@@ -415,7 +438,7 @@ namespace KnockKnockArena.Gameplay
         /// </summary>
         /// <summary>The thud of this character's punch landing, at the hit point.</summary>
         public void PlayPunchHit(Vector3 position) =>
-            SpatialAudio.Play(_punchHitSounds, position, _punchHitVolume);
+            SpatialAudio.Play(_punchHitSounds, position, _punchHitVolume, kind: SoundKind.Weapon);
 
         public void Punch()
         {
@@ -430,7 +453,7 @@ namespace KnockKnockArena.Gameplay
 
             _nextPunchIsLeft = !left;
             StartCoroutine(PunchRoutine(left));
-            SpatialAudio.Play(_punchSwingSounds, transform.position, _punchSwingVolume);
+            SpatialAudio.Play(_punchSwingSounds, transform.position, _punchSwingVolume, kind: SoundKind.Weapon);
         }
 
         /// <summary>
@@ -546,7 +569,7 @@ namespace KnockKnockArena.Gameplay
                 _landingDustInstance.Play();
             }
 
-            SpatialAudio.Play(_landingSounds, transform.position, _landingVolume);
+            SpatialAudio.Play(_landingSounds, transform.position, _landingVolume, kind: SoundKind.Footstep);
         }
     }
 

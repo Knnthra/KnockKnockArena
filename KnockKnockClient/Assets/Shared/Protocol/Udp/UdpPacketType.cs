@@ -15,6 +15,7 @@ namespace KnockKnockArena.Shared.Protocol.Udp
 
         // Server -> client
         Snapshot = 100,
+        ShotsFired = 101,   // new in protocol v5 (see ShotsFiredPacket)
         DiscoveryResponse = 102, // new in protocol v6: answer to DiscoveryRequest
     }
 

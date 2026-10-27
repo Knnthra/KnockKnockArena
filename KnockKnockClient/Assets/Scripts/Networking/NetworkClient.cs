@@ -34,6 +34,10 @@ namespace KnockKnockArena.Networking
         /// Drained on the Unity main thread.</summary>
         public readonly ConcurrentQueue<object> TcpMessages = new ConcurrentQueue<object>();
 
+        /// <summary>Other players' shots (ShotsFired over UDP), for the main thread to
+        /// draw. Cosmetic: a lost packet costs one tracer, nothing else.</summary>
+        public readonly ConcurrentQueue<ShotsFiredPacket> ShotEvents = new ConcurrentQueue<ShotsFiredPacket>();
+
         /// <summary>Delay applied to all UDP traffic in BOTH directions (so the round
         /// trip is twice this). Makes latency problems visible on localhost.</summary>
         public int SimulatedLatencyMs;
@@ -51,6 +55,15 @@ namespace KnockKnockArena.Networking
 
         /// <summary>True once the first snapshot has arrived (= the UDP join succeeded).</summary>
         public bool InGame => _inGame;
+
+        /// <summary>
+        /// The server tick the player is LOOKING AT (M08): other players are drawn
+        /// this far in the past (interpolation, M07), so this is the picture a shot is
+        /// aimed at. Set every frame by the bootstrap from its render clock and sent in
+        /// every input, so lag compensation rewinds to what the shooter actually saw.
+        /// 0 = not known yet: the newest snapshot's tick is sent instead.
+        /// </summary>
+        public uint ViewTick;
 
         /// <summary>Input packets sent so far (the index of the newest one).</summary>
         public uint InputIndex => _inputIndex;
@@ -297,6 +310,11 @@ namespace KnockKnockArena.Networking
             try
             {
                 UdpPacketType type = UdpPacketIO.PeekType(datagram);
+                if (type == UdpPacketType.ShotsFired)
+                {
+                    ShotEvents.Enqueue(ShotsFiredPacket.FromDatagram(datagram));
+                    return;
+                }
                 if (type != UdpPacketType.Snapshot)
                     return;
 
@@ -347,9 +365,12 @@ namespace KnockKnockArena.Networking
         /// <see cref="HeartbeatLoop"/> for the gaps it covers.</summary>
         public uint SendInput(MovementBits movement, float aimX, float aimZ, ButtonBits buttons, byte weaponId)
         {
-            uint tickEstimate;
-            lock (_snapshotGate)
-                tickEstimate = _latestSnapshot?.ServerTick ?? 0;
+            uint tickEstimate = ViewTick;
+            if (tickEstimate == 0)
+            {
+                lock (_snapshotGate)
+                    tickEstimate = _latestSnapshot?.ServerTick ?? 0;
+            }
 
             uint index = ++_inputIndex;
             UdpSend(new InputPacket

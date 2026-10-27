@@ -2,6 +2,9 @@ using UnityEngine;
 
 namespace KnockKnockArena.Gameplay
 {
+    /// <summary>What a sound is, so the settings menu (GameMenu) can turn a kind off or down.</summary>
+    public enum SoundKind { Other, Footstep, Weapon }
+
     /// <summary>
     /// One-shot 3D sounds with a range that fits the arena: full volume up close,
     /// fading linearly to silence at <see cref="MaxDistance"/>. Footsteps, shots and
@@ -17,6 +20,29 @@ namespace KnockKnockArena.Gameplay
     /// </summary>
     public static class SpatialAudio
     {
+        // The settings menu's sound settings (GameMenu), kept in PlayerPrefs between runs.
+        public static bool FootstepsEnabled = PlayerPrefs.GetInt("kka.sound.footsteps", 1) == 1;
+        public static float FootstepsVolume = PlayerPrefs.GetFloat("kka.sound.footstepsVolume", 1f);
+        public static bool WeaponsEnabled = PlayerPrefs.GetInt("kka.sound.weapons", 1) == 1;
+        public static float WeaponsVolume = PlayerPrefs.GetFloat("kka.sound.weaponsVolume", 1f);
+
+        public static void SaveSettings()
+        {
+            PlayerPrefs.SetInt("kka.sound.footsteps", FootstepsEnabled ? 1 : 0);
+            PlayerPrefs.SetFloat("kka.sound.footstepsVolume", FootstepsVolume);
+            PlayerPrefs.SetInt("kka.sound.weapons", WeaponsEnabled ? 1 : 0);
+            PlayerPrefs.SetFloat("kka.sound.weaponsVolume", WeaponsVolume);
+            PlayerPrefs.Save();
+        }
+
+        // the menu's factor for a kind: 0 when it is turned off
+        private static float Factor(SoundKind kind) => kind switch
+        {
+            SoundKind.Footstep => FootstepsEnabled ? FootstepsVolume : 0f,
+            SoundKind.Weapon => WeaponsEnabled ? WeaponsVolume : 0f,
+            _ => 1f,
+        };
+
         /// <summary>Within this distance a sound plays at full volume.</summary>
         public static float MinDistance = 4f;
 
@@ -29,16 +55,19 @@ namespace KnockKnockArena.Gameplay
         /// A small pitch spread keeps rapid repeats (an AK burst, footsteps) from
         /// sounding like a machine.</summary>
         public static void Play(AudioClip[] clips, Vector3 position, float volume = 1f,
-            float maxDistance = -1f, float pitchJitter = 0.05f)
+            float maxDistance = -1f, float pitchJitter = 0.05f, SoundKind kind = SoundKind.Other)
         {
             if (clips == null || clips.Length == 0)
                 return;
-            Play(clips[Random.Range(0, clips.Length)], position, volume, maxDistance, pitchJitter);
+            Play(clips[Random.Range(0, clips.Length)], position, volume, maxDistance, pitchJitter, kind);
         }
 
         public static void Play(AudioClip clip, Vector3 position, float volume = 1f,
-            float maxDistance = -1f, float pitchJitter = 0.05f)
+            float maxDistance = -1f, float pitchJitter = 0.05f, SoundKind kind = SoundKind.Other)
         {
+            if (kind == SoundKind.Other && WeaponGrip.IsWeaponSound(clip))
+                kind = SoundKind.Weapon;   // a weapon's fire or impact sound, played without saying so
+            volume *= Factor(kind);
             if (clip == null || volume <= 0f)
                 return;
 

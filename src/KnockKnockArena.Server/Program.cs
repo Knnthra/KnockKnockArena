@@ -59,7 +59,6 @@ udpServer.KickPlayer = server.KickByPlayerId;
 udpServer.PickupTaken = pickup =>
     server.BroadcastPickupTaken(pickup.PlayerId, pickup.PlayerName, pickup.PickupId, (byte)pickup.Type);
 
-
 server.Start();
 udpServer.Start();
 
@@ -71,7 +70,7 @@ Console.CancelKeyPress += (_, e) =>
 };
 
 // Console commands for local debugging.
-Log.Info("Commands: status | quit");
+Log.Info("Commands: status | rewind on | rewind off | quit");
 while (!shutdown.IsSet)
 {
     string? line = Console.ReadLine();
@@ -84,7 +83,17 @@ while (!shutdown.IsSet)
             Log.Info($"version={TcpGameServer.ServerVersion} " +
                      $"uptime={server.Uptime:hh\\:mm\\:ss} " +
                      $"players={server.PlayersOnline}/{config.MaxPlayers} " +
-                     $"inGame={world.PlayerCount} tick={world.ServerTick}");
+                     $"inGame={world.PlayerCount} tick={world.ServerTick} " +
+                     $"rewind={(world.RewindEnabled ? "on" : "off")}");
+            break;
+        // Lag compensation on and off in one take, no restart (M08).
+        case "rewind on":
+            world.RewindEnabled = true;
+            Log.Info("Rewind is on: shots are judged where the targets were at the tick the shooter saw");
+            break;
+        case "rewind off":
+            world.RewindEnabled = false;
+            Log.Info("Rewind is off: shots are judged where the targets are now");
             break;
         case "quit":
             shutdown.Set();
@@ -92,7 +101,7 @@ while (!shutdown.IsSet)
         case "":
             break;
         default:
-            Log.Info("Unknown command. Commands: status | quit");
+            Log.Info("Unknown command. Commands: status | rewind on | rewind off | quit");
             break;
     }
 }

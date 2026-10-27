@@ -139,7 +139,7 @@ MonoBehaviour:
   HitEffectPrefab: {fileID: 8297315600732588071, guid: 548f4453d5303b948b7baddd3f78e385, type: 3}
   FireSounds:
   - {fileID: 8300000, guid: b87dd8a9e20b3864baeb7e5d99335ffa, type: 3}
-  FireVolume: 0.5
+  FireVolume: 1
   ImpactSounds: []
   ImpactVolume: 1
 --- !u!4 &4075627351798996521 stripped
