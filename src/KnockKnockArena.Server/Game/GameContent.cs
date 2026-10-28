@@ -10,7 +10,9 @@ namespace KnockKnockArena.Server.Game;
 /// client reads its own copy (Assets/Arena/arena.json) with the same parser — the two
 /// sides agree only because the two files happen to be the same. Module 8: the weapon
 /// table (data/weapons.json), with the same shared JSON code - the client has its own
-/// copy too. Fetching both from the server comes in M10; the pickup table in M09.
+/// copy too. Fetching both from the server comes in M10. Module 9: the pickup table
+/// (data/pickups.json, the pickup radius per type) - server-only, the client never
+/// predicts pickups.
 /// </summary>
 public sealed class GameContent
 {
@@ -57,15 +59,40 @@ public sealed class GameContent
             throw new InvalidOperationException($"{weaponsPath}: {ex.Message}", ex);
         }
 
+        PickupTable pickups = LoadPickups(config.PickupsPath);
+
         ArenaMap.Load(map);
         WeaponStats.Load(weapons);
+        PickupTable.Load(pickups);
 
         Log.Info($"Arena \"{map.Name}\" loaded from {mapPath}: " +
                  $"{map.Walls.Length} walls, {map.SpawnPoints.Length} spawn points, " +
                  $"hash {ArenaMapData.FormatHash(map.Hash)}");
         Log.Info($"Weapon table loaded from {weaponsPath}: {weapons.Length} weapons");
+        Log.Info($"Pickup radii: {pickups.Describe()}");
 
         return new GameContent(map, mapPath, weaponsPath);
+    }
+
+    /// <summary>The pickup table is optional — an older data directory without it
+    /// runs on the default radius. A file that IS there but broken still stops the
+    /// server, for the same reason a broken map does.</summary>
+    private static PickupTable LoadPickups(string path)
+    {
+        if (!File.Exists(path))
+        {
+            Log.Warn($"No pickup table at {path} — every pickup uses the default radius " +
+                     $"of {GameConstants.PickupRadius} m");
+            return PickupTable.Defaults();
+        }
+        try
+        {
+            return PickupTable.Parse(ReadFile(path, "pickup table"));
+        }
+        catch (Exception ex) when (ex is not InvalidOperationException)
+        {
+            throw new InvalidOperationException($"{path}: {ex.Message}", ex);
+        }
     }
 
     private static string ReadFile(string path, string what)

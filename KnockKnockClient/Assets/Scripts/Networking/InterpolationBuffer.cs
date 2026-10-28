@@ -40,6 +40,9 @@ namespace KnockKnockArena.Networking
                 _samples.RemoveAt(0);
         }
 
+        /// <summary>For entities without an aim (rockets): the position stands in.</summary>
+        public void Add(uint tick, float x, float z) => Add(tick, x, z, x, z);
+
         /// <summary>
         /// The newest sample, unblended — what you render when interpolation is
         /// switched off in the HUD. Entities then jump from snapshot to snapshot at
@@ -53,6 +56,8 @@ namespace KnockKnockArena.Networking
             (_, x, z, aimX, aimZ) = _samples[_samples.Count - 1];
             return true;
         }
+
+        public bool TryLatest(out float x, out float z) => TryLatest(out x, out z, out _, out _);
 
         public bool TrySample(double renderTick, out float x, out float z, out float aimX, out float aimZ)
         {
@@ -102,5 +107,8 @@ namespace KnockKnockArena.Networking
             (_, x, z, aimX, aimZ) = _samples[_samples.Count - 1];
             return true;
         }
+
+        public bool TrySample(double renderTick, out float x, out float z) =>
+            TrySample(renderTick, out x, out z, out _, out _);
     }
 }

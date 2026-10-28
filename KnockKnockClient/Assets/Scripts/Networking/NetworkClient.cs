@@ -172,8 +172,17 @@ namespace KnockKnockArena.Networking
                         case MessageType.PlayerLeft:
                             TcpMessages.Enqueue(PlayerLeft.FromPayload(payload));
                             break;
+                        case MessageType.PlayerDied:
+                            TcpMessages.Enqueue(PlayerDied.FromPayload(payload));
+                            break;
                         case MessageType.PickupTaken:
                             TcpMessages.Enqueue(PickupTaken.FromPayload(payload));
+                            break;
+                        case MessageType.RocketExploded:
+                            TcpMessages.Enqueue(RocketExploded.FromPayload(payload));
+                            break;
+                        case MessageType.PlayerDamaged:
+                            TcpMessages.Enqueue(PlayerDamaged.FromPayload(payload));
                             break;
                         default:
                             // Unknown types are skipped: framing already consumed the

@@ -18,7 +18,8 @@ namespace KnockKnockArena.Server.Net;
 /// packets, and a tick thread that advances the world at a fixed 30 Hz and sends a
 /// full snapshot to every joined player each tick.
 ///
-/// Module 7: pickups in the snapshot, and taken pickups announced on TCP.
+/// Module 9: the tick's events (kills, pickups taken, rocket explosions, damage) are
+/// handed to TCP, the reliable channel.
 /// </summary>
 public sealed class UdpGameServer
 {
@@ -31,9 +32,19 @@ public sealed class UdpGameServer
     /// player entirely, which also produces the PlayerLeft event on TCP.</summary>
     public Action<byte, string>? KickPlayer;
 
-    /// <summary>Wired to TcpGameServer.BroadcastPickupTaken: taking a pickup is an
-    /// event every client must hear about, so it goes on the reliable channel.</summary>
+    /// <summary>Wired to TcpGameServer.BroadcastPlayerDied: kills go out on TCP as
+    /// kill feed events (important events belong on the reliable channel).</summary>
+    public Action<KillEvent>? PlayerKilled;
+
+    /// <summary>Wired to TcpGameServer.BroadcastPickupTaken.</summary>
     public Action<PickupTakenEvent>? PickupTaken;
+
+    /// <summary>Wired to TcpGameServer.BroadcastRocketExploded.</summary>
+    public Action<RocketExplodedEvent>? RocketExploded;
+
+    /// <summary>Wired to TcpGameServer.BroadcastPlayerDamaged: the hit point, so
+    /// clients can play blood where the shot actually landed.</summary>
+    public Action<DamageEvent>? PlayerDamaged;
 
     public UdpGameServer(ServerConfig config, SessionManager sessions, GameWorld world)
     {
@@ -217,7 +228,10 @@ public sealed class UdpGameServer
 
         List<(IPEndPoint EndPoint, byte[] Datagram)> snapshotSends = new();
         List<PlayerState> timedOut = new();
+        List<KillEvent> kills = new();
         List<PickupTakenEvent> pickupsTaken = new();
+        List<RocketExplodedEvent> explosions = new();
+        List<DamageEvent> damage = new();
 
         while (true)
         {
@@ -238,12 +252,20 @@ public sealed class UdpGameServer
 
             snapshotSends.Clear();
             timedOut.Clear();
+            kills.Clear();
             pickupsTaken.Clear();
-            _world.Tick(snapshotSends, timedOut, pickupsTaken);
+            explosions.Clear();
+            damage.Clear();
+            _world.Tick(snapshotSends, timedOut, kills, pickupsTaken, explosions, damage);
 
+            foreach (KillEvent kill in kills)
+                PlayerKilled?.Invoke(kill);
             foreach (PickupTakenEvent pickup in pickupsTaken)
                 PickupTaken?.Invoke(pickup);
-            
+            foreach (RocketExplodedEvent explosion in explosions)
+                RocketExploded?.Invoke(explosion);
+            foreach (DamageEvent hit in damage)
+                PlayerDamaged?.Invoke(hit);
 
             foreach ((IPEndPoint endPoint, byte[] datagram) in snapshotSends)
             {

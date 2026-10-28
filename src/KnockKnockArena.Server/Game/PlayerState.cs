@@ -10,8 +10,8 @@ namespace KnockKnockArena.Server.Game;
 /// <summary>
 /// Server-side state for one player that has joined the game world via UDP.
 /// Inputs are enqueued by the UDP receive thread and consumed by the tick thread.
-/// Module 8: position, aim, dash, weapons, ammo, spread, and the position history
-/// lag compensation rewinds into. Health comes in M09.
+/// Module 9: position, aim, dash, weapons, ammo, spread, the position history lag
+/// compensation rewinds into - and health, frags/deaths and the life state.
 /// </summary>
 public sealed class PlayerState
 {
@@ -24,8 +24,12 @@ public sealed class PlayerState
     public float Z;
     public float AimX;
     public float AimZ;
+    public byte Health = 100;
     public WeaponId ActiveWeapon = WeaponId.Glock;
     public byte OwnedWeapons = (1 << (int)WeaponId.Punch) | (1 << (int)WeaponId.Glock);
+    public ushort Frags;
+    public ushort Deaths;
+    public PlayerLifeState LifeState = PlayerLifeState.Alive;
 
     /// <summary>Dash simulation state (shared rule) — carried in every snapshot so
     /// the owning client can seed prediction replay from it.</summary>
@@ -66,6 +70,10 @@ public sealed class PlayerState
 
     /// <summary>The first server tick the player may fire again (cooldown gate).</summary>
     public uint NextFireAllowedTick;
+
+    public uint DeathTick;
+    public float DeathX;
+    public float DeathZ;
 
     // Position history for lag compensation: a ring buffer with one slot per tick,
     // covering the last RewindBufferTicks ticks (1 second).

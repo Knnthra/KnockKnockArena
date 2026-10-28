@@ -55,9 +55,15 @@ server.PlayerDisconnected += session =>
 };
 // UDP silence -> full disconnect (S01: timeout gives a TCP event + despawn).
 udpServer.KickPlayer = server.KickByPlayerId;
-// Pickups taken in the tick loop -> an event on TCP.
+// Events from the tick loop -> TCP: they must arrive, so they go on the reliable channel.
+udpServer.PlayerKilled = kill =>
+    server.BroadcastPlayerDied(kill.KillerId, kill.KillerName, kill.VictimId, kill.VictimName, (byte)kill.Weapon);
 udpServer.PickupTaken = pickup =>
     server.BroadcastPickupTaken(pickup.PlayerId, pickup.PlayerName, pickup.PickupId, (byte)pickup.Type);
+udpServer.RocketExploded = explosion =>
+    server.BroadcastRocketExploded(explosion.RocketEntityId, explosion.X, explosion.Z, explosion.OwnerId);
+udpServer.PlayerDamaged = hit =>
+    server.BroadcastPlayerDamaged(hit.VictimId, hit.X, hit.Z, hit.AttackerId, (byte)hit.Weapon, hit.Damage);
 
 server.Start();
 udpServer.Start();

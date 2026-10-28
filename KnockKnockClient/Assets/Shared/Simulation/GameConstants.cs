@@ -59,6 +59,17 @@ namespace KnockKnockArena.Shared.Simulation
         /// rates. This constant only catches a table that omits the field.</summary>
         public const float RocketSpeed = 18f;
 
+        /// <summary>The rocket launcher's projectile speed from the weapon table,
+        /// falling back to <see cref="RocketSpeed"/>. One resolver, used by the
+        /// server's flight step and the client's predicted rocket alike — the two
+        /// MUST agree, or the predicted visual drifts off the authoritative path.</summary>
+        public static float ResolveRocketSpeed()
+        {
+            if (!WeaponStats.IsLoaded)
+                return RocketSpeed;
+            float speed = WeaponStats.For(Protocol.Udp.WeaponId.RocketLauncher).ProjectileSpeed;
+            return speed > 0f ? speed : RocketSpeed;
+        }
         public const float RocketSplashRadius = 3.5f;
         public const int RocketSplashMaxDamage = 60;
 

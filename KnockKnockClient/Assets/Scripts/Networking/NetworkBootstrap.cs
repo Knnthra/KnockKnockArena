@@ -1,4 +1,5 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using KnockKnockArena.Gameplay;
 using KnockKnockArena.Shared.Protocol.Messages;
@@ -19,10 +20,19 @@ namespace KnockKnockArena.Networking
     /// ("favor the shooter"), mirrors the spread in the crosshair, predicts a weapon
     /// switch, and draws other players' shots from ShotsFired, delayed like their
     /// figures. Every input carries the tick on screen (NetworkClient.ViewTick), so
-    /// lag compensation rewinds to what the shooter saw. The dev UI is
-    /// NetworkHud (handed out): it only reads the public properties below, listens to
-    /// the two events and calls the public methods. Nothing here draws IMGUI; the
-    /// crosshair and the weapon bar are the base project's components, fed below.
+    /// lag compensation rewinds to what the shooter saw.
+    ///
+    /// MODULE 9: the consequences. Damage arrives as PlayerDamaged and plays blood
+    /// where the hit landed; death shatters the figure, fills the kill feed and the
+    /// Tab scoreboard, and Fire respawns after the delay — with the prediction
+    /// restarted, because a respawn is a teleport, not a misprediction. The punch
+    /// swings on the click. The rocket is predicted locally on the click and drawn
+    /// from the snapshot for everyone else; RocketExploded ends it.
+    ///
+    /// The dev UI is NetworkHud (handed out): it only reads the public properties
+    /// below, listens to the two events and calls the public methods. Nothing here
+    /// draws IMGUI; the crosshair, the weapon bar and the status HUD are the base
+    /// project's components, fed below.
     /// </summary>
     public sealed class NetworkBootstrap : MonoBehaviour
     {
@@ -70,6 +80,14 @@ namespace KnockKnockArena.Networking
         [Tooltip("Dash ability icon with the radial cooldown sweep. Optional.")]
         public DashCooldownIcon DashCooldownIcon;
 
+        [Tooltip("The CS corners: health bottom-left, ammo bottom-right. Fed health " +
+                 "and the displayed weapon's pool every frame.")]
+        public StatusHud StatusHud;
+
+        [Tooltip("Blood burst played where a hit lands (the SplatterEffect prefab). " +
+                 "Leave empty for no blood — it is cosmetic and nothing depends on it.")]
+        public GameObject BloodEffect;
+
         [Tooltip("Prefab used for every player view. Its pivot must be at the FEET. " +
                  "Empty = primitive cube placeholders.")]
         public GameObject PlayerViewPrefab;
@@ -107,11 +125,24 @@ namespace KnockKnockArena.Networking
         public string FirstMismatch { get; private set; } = "";
 
         // The own weapon line (M08): known once the first snapshot with us in it has
-        // arrived. Ammo is the server's, for the active weapon.
+        // arrived. Ammo is the server's, for the active weapon; so is Health (M09).
         public bool HasOwnState => _me != null;
         public int Ammo => _me?.Ammo ?? 0;
+        public int Health => _me?.Health ?? 0;
 
-        // A chat line, and a feed line (joined, left, took a pickup), ready to show.
+        // Death and score (M09): the session's frags and deaths, and while dead the
+        // time left before Fire respawns you. The Tab scoreboard is every player in
+        // the newest snapshot, named from the roster.
+        public int Frags => _me?.Frags ?? 0;
+        public int Deaths => _me?.Deaths ?? 0;
+        public bool IsDead => _me != null && _me.State == PlayerLifeState.Dead;
+        public float RespawnSecondsLeft => GameConstants.RespawnDelaySeconds - (Time.time - _diedAtTime);
+        public IReadOnlyList<PlayerEntityState> ScoreboardPlayers => _scoreboardPlayers;
+        public IReadOnlyDictionary<byte, string> Usernames => _usernames;
+        public byte LocalPlayerId => _client?.PlayerId ?? 0;
+
+        // A chat line, and a feed line (joined, left, took a pickup, a kill, a rocket
+        // exploding), ready to show.
         public event Action<string> ChatReceived;
         public event Action<string> PlayerFeed;
 
@@ -140,8 +171,18 @@ namespace KnockKnockArena.Networking
         private bool _renderTickInitialized;
         private uint _latestSnapshotTick;
 
-        // Our own player entity from the newest snapshot (weapon, ammo).
+        // Our own player entity from the newest snapshot (weapon, ammo, health).
         private PlayerEntityState _me;
+
+        // Death and respawn (M09). Every player in the newest snapshot, for the Tab
+        // scoreboard; the last seen life state per player, for spotting the moment of
+        // death (voxel shatter) and of respawn (model back) — state lives in every
+        // snapshot, the TRANSITION is what the effect hangs on.
+        private List<PlayerEntityState> _scoreboardPlayers = new List<PlayerEntityState>();
+        private readonly Dictionary<ushort, PlayerLifeState> _lastLifeStates =
+            new Dictionary<ushort, PlayerLifeState>();
+        private bool _aliveInLastSnapshot = true;
+        private float _diedAtTime;
 
         // Weapon switching is PREDICTED, like movement: the weapon you asked for is
         // shown at once, and the request keeps riding along in every input until the
@@ -273,6 +314,7 @@ namespace KnockKnockArena.Networking
 
             UpdateRemoteViews();
             UpdateRemoteShots();
+            UpdatePredictedRockets();
             SampleAndSendInputs();
             UpdateDashIcon();
             UpdateCrosshair();
@@ -309,6 +351,8 @@ namespace KnockKnockArena.Networking
                 Crosshair.SetVisible(false);
             if (ActionBar != null)
                 ActionBar.gameObject.SetActive(false);
+            if (StatusHud != null)
+                StatusHud.gameObject.SetActive(false);
             _pendingInputs.Clear();
             Reconciliations = 0;
             BitMismatches = 0;
@@ -321,6 +365,24 @@ namespace KnockKnockArena.Networking
             _remoteDashTicks.Clear();
             _remoteBuffers.Clear();
             _renderTickInitialized = false;
+
+            // Death and respawn (M09).
+            _scoreboardPlayers = new List<PlayerEntityState>();
+            _lastLifeStates.Clear();
+            _aliveInLastSnapshot = true;
+            _diedAtTime = 0f;
+
+            // Rockets (M09): the predicted visuals and the snapshot's rocket views.
+            foreach (PredictedRocket predicted in _predictedRockets)
+                if (predicted.Go != null)
+                    Destroy(predicted.Go);
+            _predictedRockets.Clear();
+            foreach (GameObject view in _rocketViews.Values)
+                Destroy(view);
+            _rocketViews.Clear();
+            _rocketHeights.Clear();
+            _selfDrivenRockets.Clear();
+            _explodedRockets.Clear();
 
             // The scene's pickups stay in the scene; offline, they are all there.
             foreach (GameObject pickup in _pickupViews)
@@ -446,6 +508,24 @@ namespace KnockKnockArena.Networking
                         PlayerFeed?.Invoke($"{taken.Username} took {taken.Type}");
                         break;
 
+                    case PlayerDamaged hit:
+                        // Effects play on EVENTS. The snapshot shows health dropping,
+                        // but only this carries WHERE the shot went in — the server
+                        // computes it during hit detection and nothing else knows it.
+                        SpawnBlood(hit);
+                        break;
+
+                    case PlayerDied died:
+                        // Names ride along on kill events too — cheap robustness.
+                        _usernames[died.KillerId] = died.KillerUsername;
+                        _usernames[died.VictimId] = died.VictimUsername;
+                        PlayerFeed?.Invoke($"{died.KillerUsername} killed {died.VictimUsername} ({(WeaponId)died.WeaponId})");
+                        break;
+
+                    case RocketExploded exploded:
+                        HandleRocketExploded(exploded);
+                        break;
+
                     case TcpDisconnectedEvent disconnected:
                         Disconnect($"Disconnected: {disconnected.Reason}");
                         break;
@@ -457,6 +537,8 @@ namespace KnockKnockArena.Networking
 
         private void ApplySnapshot(SnapshotPacket snapshot)
         {
+            _scoreboardPlayers = snapshot.Players;
+
             List<ushort> liveIds = new List<ushort>();
             foreach (PlayerEntityState player in snapshot.Players)
             {
@@ -496,6 +578,8 @@ namespace KnockKnockArena.Networking
                 if (_characterVisuals.TryGetValue(player.EntityId, out CharacterVisual weaponVisual) && weaponVisual != null)
                     weaponVisual.SetWeapon(shownWeapon);
 
+                ApplyLifeState(player, view);
+
                 if (player.EntityId == _client.PlayerId)
                 {
                     _me = player;
@@ -532,7 +616,10 @@ namespace KnockKnockArena.Networking
                 _characterVisuals.Remove(id);
                 _remoteBuffers.Remove(id);
                 _remoteDashTicks.Remove(id);
+                _lastLifeStates.Remove(id);
             }
+
+            ApplyRocketSnapshot(snapshot);
 
             // Steer the render clock: it should sit InterpolationDelayTicks behind
             // the newest snapshot.
@@ -605,6 +692,8 @@ namespace KnockKnockArena.Networking
                     visual.SetAimPoint(new Vector3(aimX, PlayerY, aimZ));
                 }
             }
+
+            UpdateRemoteRocketViews();
         }
 
         /// <summary>
@@ -678,6 +767,24 @@ namespace KnockKnockArena.Networking
                 _prevPredictedZ = me.Z;
                 _predictedDash = DashOf(me);
                 _predictionInitialized = true;
+                _aliveInLastSnapshot = me.State == PlayerLifeState.Alive;
+                return;
+            }
+
+            if (me.State != PlayerLifeState.Alive)
+            {
+                if (_aliveInLastSnapshot)
+                    _diedAtTime = Time.time; // for the respawn countdown in the HUD
+
+                // Dead: the server ACKs inputs but ignores movement — prediction
+                // pauses and just tracks the authority.
+                _pendingInputs.Clear();
+                _predictedX = me.X;
+                _predictedZ = me.Z;
+                _prevPredictedX = me.X;
+                _prevPredictedZ = me.Z;
+                _predictedDash = DashOf(me);
+                _aliveInLastSnapshot = false;
                 return;
             }
 
@@ -696,6 +803,7 @@ namespace KnockKnockArena.Networking
                 _prevPredictedX = me.X;
                 _prevPredictedZ = me.Z;
                 _predictedDash = DashOf(me);
+                _aliveInLastSnapshot = true;
                 return;
             }
 
@@ -707,6 +815,19 @@ namespace KnockKnockArena.Networking
             foreach ((uint _, MovementBits movement, float aimX, float aimZ) in _pendingInputs)
                 MovementSimulation.Step(ref replayedX, ref replayedZ, ref replayedDash,
                     movement, aimX, aimZ, GameConstants.TickDeltaTime);
+
+            if (!_aliveInLastSnapshot)
+            {
+                // Just respawned: re-seed the prediction (a respawn is a legitimate
+                // teleport, not a misprediction).
+                _predictedX = replayedX;
+                _predictedZ = replayedZ;
+                _prevPredictedX = replayedX;
+                _prevPredictedZ = replayedZ;
+                _predictedDash = replayedDash;
+                _aliveInLastSnapshot = true;
+                return;
+            }
 
             Reconciliations++;
             bool identical =
@@ -785,6 +906,16 @@ namespace KnockKnockArena.Networking
                 Vector3 aim = AimSource != null && AimSource.HasAim
                     ? AimSource.AimPoint
                     : Vector3.zero;
+
+                // Dead: the server ignores a dead player's movement, so say nothing
+                // and let the heartbeat keep the session alive. A button press breaks
+                // the silence at once — Fire respawns you after the delay.
+                bool dead = _me != null && _me.State != PlayerLifeState.Alive;
+                if (dead && buttons == ButtonBits.None)
+                {
+                    TickShotCosmetics(buttons, aim); // bloom still recovers while quiet
+                    continue;
+                }
 
                 uint inputIndex = _client.SendInput(movement, aim.x, aim.z, buttons, weaponId);
 
@@ -892,22 +1023,30 @@ namespace KnockKnockArena.Networking
             if (_cosmeticCooldownTicks > 0)
                 _cosmeticCooldownTicks--;
 
-            if ((buttons & ButtonBits.Fire) == 0 || _cosmeticCooldownTicks > 0)
+            if ((buttons & ButtonBits.Fire) == 0 || _me.State != PlayerLifeState.Alive || _cosmeticCooldownTicks > 0)
                 return;
 
             WeaponStats stats = WeaponStats.For(_cosmeticWeapon);
-            // Module 8: firearms. The punch comes in M09, and so does the rocket.
-            if (stats.IsMelee || _cosmeticWeapon == WeaponId.RocketLauncher)
-                return;
 
+            // Melee is exempt from the 2 m dead zone — a punch is thrown at point-blank
+            // range by definition; only an aim point on your own position is refused.
             float directionX = aim.x - _predictedX;
             float directionZ = aim.z - _predictedZ;
-            if (Mathf.Sqrt(directionX * directionX + directionZ * directionZ) < GameConstants.DeadZoneMeters)
-                return; // the server would reject this shot (dead zone)
-            if (_me.Ammo == 0)
+            float aimDistanceSquared = directionX * directionX + directionZ * directionZ;
+            if (stats.IsMelee ? aimDistanceSquared < GameConstants.FacingDeadZoneSquared
+                              : Mathf.Sqrt(aimDistanceSquared) < GameConstants.DeadZoneMeters)
+                return; // the server would reject this shot (dead zone; melee only on itself)
+            if (!stats.IsMelee && _me.Ammo == 0)
                 return; // the server would reject this shot (no ammo)
 
             _cosmeticCooldownTicks = Mathf.CeilToInt(stats.CooldownSeconds * GameConstants.TickRate);
+
+            if (stats.IsMelee)
+            {
+                PlayOwnPunch(stats, directionX, directionZ, Mathf.Sqrt(aimDistanceSquared));
+                return;
+            }
+
             _cosmeticBloom = SpreadModel.OnShot(_cosmeticWeapon, _cosmeticBloom);
 
             // Kick the weapon hand. Recovery takes exactly one fire interval.
@@ -923,6 +1062,16 @@ namespace KnockKnockArena.Networking
             }
             if (grip != null)
                 SpatialAudio.Play(grip.FireSounds, from, grip.FireVolume);
+
+            if (_cosmeticWeapon == WeaponId.RocketLauncher)
+            {
+                // Favor the shooter, projectile edition. The authoritative rocket only
+                // exists a round trip from now, so the click spawns the rocket VISUAL
+                // immediately, from the actual barrel; when the server's entity arrives
+                // it ADOPTS this object (ApplyRocketSnapshot).
+                SpawnPredictedRocket(aim);
+                return;
+            }
 
             // The cosmetic shot runs FROM THE BARREL TO WHAT THE CURSOR IS ON and stops
             // at the first thing the physics scene says is in the way. Deliberately
@@ -970,6 +1119,11 @@ namespace KnockKnockArena.Networking
                 return; // shooter not (or no longer) in view
 
             WeaponStats stats = WeaponStats.For(shot.Weapon);
+            if (stats.IsMelee)
+            {
+                visual.Punch(); // a punch has no round to draw — the fist is the shot
+                return;
+            }
             visual.ApplyRecoil(stats.CooldownSeconds);
 
             Vector3 from = new Vector3(visual.transform.position.x, EntityY, visual.transform.position.z);
@@ -978,6 +1132,10 @@ namespace KnockKnockArena.Networking
             WeaponGrip grip = visual.HeldWeaponGrip;
             if (grip != null)
                 SpatialAudio.Play(grip.FireSounds, from, grip.FireVolume);
+
+            // The rocket is its own entity in the snapshot — only the kick is drawn here.
+            if (shot.Weapon == WeaponId.RocketLauncher)
+                return;
 
             // The server is XZ-only: the round flies level from the barrel to the end
             // point, which already stops where the server decided — on the player it
@@ -1029,6 +1187,678 @@ namespace KnockKnockArena.Networking
             ActionBar.gameObject.SetActive(show);
             if (show)
                 ActionBar.Refresh(_me.OwnedWeapons, DisplayedWeapon);
+
+            // The CS corners: health bottom-left, the active weapon's pool bottom-
+            // right. Driven off the DISPLAYED weapon, so the count follows a
+            // predicted switch instead of trailing it by a round trip.
+            if (StatusHud != null)
+            {
+                StatusHud.gameObject.SetActive(show);
+                if (show)
+                    StatusHud.Set(_me.Health, _me.Ammo, !WeaponStats.For(DisplayedWeapon).IsMelee);
+            }
+        }
+
+        // ------------------------------------------------------------- the punch (M09)
+
+        /// <summary>
+        /// Our own punch, on the click: the arc the server actually tests (reach plus
+        /// the target's half extent, the weapon's arc angle) and the thrown fist. Both
+        /// cosmetic — the server alone decides whether the swing lands.
+        /// </summary>
+        private void PlayOwnPunch(WeaponStats stats, float directionX, float directionZ, float aimDistance)
+        {
+            directionX /= aimDistance;
+            directionZ /= aimDistance;
+
+            _characterVisuals.TryGetValue(_client.PlayerId, out CharacterVisual puncher);
+            if (puncher != null)
+                puncher.ApplyRecoil(stats.CooldownSeconds);
+
+            // Arc matching the server's actual check: reach + target half extent.
+            MeleeSwingEffect.Spawn(new Vector3(_predictedX, EntityY, _predictedZ),
+                directionX, directionZ,
+                stats.MeleeRangeMeters + ArenaMap.PlayerHalfExtent, stats.MeleeArcDeg);
+
+            if (puncher != null)
+                puncher.Punch();
+        }
+
+        // ------------------------------------------------------------- damage (M09)
+
+        /// <summary>
+        /// Blood at the point a hit landed, from the PlayerDamaged event.
+        ///
+        /// The height is the client's to choose — the server has no Y — so the burst
+        /// plays at chest height on the victim rather than at their feet, which is
+        /// where the raw XZ would put it.
+        /// </summary>
+        private void SpawnBlood(PlayerDamaged hit)
+        {
+            if ((WeaponId)hit.WeaponId == WeaponId.Punch &&
+                _characterVisuals.TryGetValue(hit.AttackerId, out CharacterVisual puncher) && puncher != null)
+            {
+                float y = ArenaMap.IsLoaded ? ArenaMap.GroundY + BloodHeight : BloodHeight;
+                puncher.PlayPunchHit(new Vector3(hit.X, y, hit.Z));
+            }
+
+            if (BloodEffect == null)
+                return;
+
+            // The server's hitscan verdict is instantaneous, but the bullet the
+            // shooter watches is theatre with a finite speed — so on a short round
+            // trip the blood would beat the bullet to the target. For OUR OWN firearm
+            // hits, hold the burst until the bullet visually gets there, the same way
+            // the wall sparks already do (they are spawned by the bullet on arrival).
+            //
+            // Other players' firearm hits wait for THEIR round as well — it is drawn
+            // from ShotsFired one interpolation delay after arrival. Melee is
+            // genuinely instant, and a rocket's blood rides the explosion.
+            float delay = 0f;
+            WeaponId weapon = (WeaponId)hit.WeaponId;
+            if (_client != null && hit.AttackerId != _client.PlayerId &&
+                (weapon == WeaponId.Glock || weapon == WeaponId.Ak47) &&
+                _characterVisuals.TryGetValue(hit.AttackerId, out CharacterVisual shooter) && shooter != null)
+            {
+                Vector3 from = shooter.transform.position;
+                if (shooter.TryGetMuzzle(out Vector3 remoteMuzzle))
+                    from = remoteMuzzle;
+                WeaponGrip remoteGrip = shooter.HeldWeaponGrip;
+                float remoteSpeed = remoteGrip != null && remoteGrip.ProjectileSpeed > 0f ? remoteGrip.ProjectileSpeed : 80f;
+                float remoteDistance = Vector3.Distance(new Vector3(from.x, 0f, from.z), new Vector3(hit.X, 0f, hit.Z));
+                delay = RemoteShotDelaySeconds + remoteDistance / remoteSpeed;
+            }
+            if (_client != null && hit.AttackerId == _client.PlayerId &&
+                (weapon == WeaponId.Glock || weapon == WeaponId.Ak47))
+            {
+                Vector3 from = new Vector3(_predictedX, 0f, _predictedZ);
+                WeaponGrip grip = null;
+                if (_characterVisuals.TryGetValue(_client.PlayerId, out CharacterVisual visual) &&
+                    visual != null)
+                {
+                    if (visual.TryGetMuzzle(out Vector3 muzzle))
+                        from = new Vector3(muzzle.x, 0f, muzzle.z);
+                    grip = visual.HeldWeaponGrip;
+                }
+
+                float speed = grip != null && grip.ProjectileSpeed > 0f ? grip.ProjectileSpeed : 80f;
+                float distance = Vector3.Distance(from, new Vector3(hit.X, 0f, hit.Z));
+
+                // The event spent a round trip coming back, and the bullet has been
+                // flying that whole time — only wait out the remainder.
+                float alreadyFlying = 2f * SimulatedLatencyMs / 1000f;
+                delay = Mathf.Max(0f, distance / speed - alreadyFlying);
+            }
+
+            if (delay > 0.01f)
+                StartCoroutine(SpawnBloodAfter(delay, hit));
+            else
+                SpawnBloodNow(hit);
+        }
+
+        private IEnumerator SpawnBloodAfter(float delay, PlayerDamaged hit)
+        {
+            yield return new WaitForSeconds(delay);
+            SpawnBloodNow(hit);
+        }
+
+        private void SpawnBloodNow(PlayerDamaged hit)
+        {
+            float y = ArenaMap.IsLoaded ? ArenaMap.GroundY + BloodHeight : BloodHeight;
+            GameObject burst = Instantiate(BloodEffect, new Vector3(hit.X, y, hit.Z),
+                Quaternion.identity);
+
+            foreach (Gameplay.SplatterEffect splatter in
+                     burst.GetComponentsInChildren<Gameplay.SplatterEffect>())
+            {
+                // A punch and a rocket should not leave the same mess. Damage runs
+                // 5 (punch) to 100 (rocket), so scale around 20.
+                splatter.SetIntensity(Mathf.Clamp(hit.Damage / 20f, 0.4f, 3f));
+                splatter.Play();
+            }
+        }
+
+        /// <summary>Chest height above the floor. The burst reads as coming out of a
+        /// body rather than off the ground.</summary>
+        private const float BloodHeight = 1.4f;
+
+        // ------------------------------------------------------------- death and respawn (M09)
+
+        /// <summary>
+        /// Death and respawn, seen as TRANSITIONS: dying shatters the model into voxels
+        /// and hides it; respawning brings it back. A player who is already dead when
+        /// we first see them (we just joined) is hidden without the show — their death
+        /// was not news.
+        /// </summary>
+        private void ApplyLifeState(PlayerEntityState player, GameObject view)
+        {
+            if (!_lastLifeStates.TryGetValue(player.EntityId, out PlayerLifeState previousState))
+            {
+                _lastLifeStates[player.EntityId] = player.State;
+                if (player.State == PlayerLifeState.Dead)
+                    SetViewVisible(view, false);
+            }
+            else if (previousState != player.State)
+            {
+                _lastLifeStates[player.EntityId] = player.State;
+                if (player.State == PlayerLifeState.Dead)
+                {
+                    // Sample the model into voxels BEFORE hiding it — the effect
+                    // reads the renderers' positions and colours as they stand.
+                    DeathVoxelEffect.Spawn(view.transform);
+                    SetViewVisible(view, false);
+                }
+                else
+                {
+                    SetViewVisible(view, true);
+                }
+            }
+        }
+
+        /// <summary>Hides or shows a player view without deactivating it — the
+        /// GameObject stays live, so hand coroutines, muzzle lookups and position
+        /// updates keep working while the model is invisible between death and
+        /// respawn. The aim collider goes with it: an invisible corpse must not
+        /// catch the cursor and skew someone's aim point.</summary>
+        private static void SetViewVisible(GameObject view, bool visible)
+        {
+            foreach (Renderer renderer in view.GetComponentsInChildren<Renderer>())
+                renderer.enabled = visible;
+            foreach (Collider collider in view.GetComponentsInChildren<Collider>())
+                collider.enabled = visible;
+        }
+
+        // ------------------------------------------------------------- rocket (M09)
+
+        // Rocket entities from the snapshot, drawn like remote players: interpolated
+        // in the past (their buffers live in _remoteBuffers, keyed by entity id).
+        private readonly Dictionary<ushort, GameObject> _rocketViews = new Dictionary<ushort, GameObject>();
+
+        /// <summary>Render height per live rocket, taken from the shooter's muzzle when
+        /// it spawned. Cleared with the view.</summary>
+        private readonly Dictionary<ushort, float> _rocketHeights = new Dictionary<ushort, float>();
+
+        /// <summary>Rocket entities whose view is a predicted visual driving itself —
+        /// the interpolation loop must leave those alone.</summary>
+        private readonly HashSet<ushort> _selfDrivenRockets = new HashSet<ushort>();
+
+        /// <summary>
+        /// Rockets the explosion event already ended. The event rides TCP, the
+        /// snapshots ride UDP, and snapshots SENT before the detonation can still be
+        /// in flight when the event lands — each of them still lists the rocket, and
+        /// without this set the client would rebuild a view for it (a ghost rocket
+        /// popping up after its own explosion) and tear it down again a beat later.
+        /// An id leaves the set at the first snapshot that no longer carries it;
+        /// from there the sequence check keeps every older snapshot out.
+        /// </summary>
+        private readonly HashSet<ushort> _explodedRockets = new HashSet<ushort>();
+
+        // The player's OWN rocket, spawned the moment they click (favor the shooter).
+        // Flight is deterministic — constant speed, straight line, same constants as
+        // the server — so the client can fly the visual itself and be right to within
+        // a tick. The server still owns everything that MATTERS: whether the shot
+        // happened at all, and when and where it explodes.
+        private sealed class PredictedRocket
+        {
+            public GameObject Go;
+            public Vector3 Position;
+
+            /// <summary>The server entity that adopted this visual (valid once Matched).</summary>
+            public ushort EntityId;
+
+            /// <summary>The visual reached its known end (aim point or wall) and already
+            /// played its explosion. The server's RocketExploded that follows a round
+            /// trip later must not play a second one.</summary>
+            public bool Detonated;
+
+            /// <summary>Normalized, y = 0 — the same flat direction the server flies.</summary>
+            public Vector3 DirectionXZ;
+
+            // The climb: Y goes StartY -> TargetY over the first ClimbXZ metres of XZ
+            // travel, then stays level. The server is XZ-only, so height is ours to
+            // draw — and what it must do is CROSS the exact 3D point under the
+            // crosshair.
+            public float TraveledXZ;
+            public float ClimbXZ;
+            public float StartY;
+            public float TargetY;
+
+            /// <summary>Where the flight ENDS: the aim point or the first geometry on
+            /// the path, whichever comes first — the same places the server's rocket
+            /// dies. The visual runs ahead of the truth by half a round trip, so
+            /// without this it overshoots the detonation and flies on past its own
+            /// explosion. It holds here until the server's event settles things.</summary>
+            public float StopXZ = float.PositiveInfinity;
+
+            public float Age;
+            public bool Matched;
+        }
+
+        private readonly List<PredictedRocket> _predictedRockets = new List<PredictedRocket>();
+
+        /// <summary>A predicted rocket the server never acknowledged (rejected shot,
+        /// lost packets) dies quietly after this long.</summary>
+        private const float PredictedRocketTimeoutSeconds = 1f;
+
+        /// <summary>How far the server's detonation may sit from the one we already
+        /// showed and still count as the same bang (float noise, the 5 cm pull-back
+        /// from walls). Beyond this the server's rocket really died elsewhere.</summary>
+        private const float LocalDetonationToleranceMeters = 1.5f;
+
+        private void SpawnPredictedRocket(Vector3 aim)
+        {
+            // From the ACTUAL barrel — the visual muzzle, wherever the hand and the
+            // body's turn have put it this frame. Without a weapon model, mirror the
+            // server's formula so the two sides at least agree.
+            Vector3 origin;
+            if (_client != null &&
+                _characterVisuals.TryGetValue(_client.PlayerId, out CharacterVisual visual) &&
+                visual != null && visual.TryGetMuzzle(out Vector3 muzzle))
+            {
+                origin = muzzle;
+            }
+            else
+            {
+                WeaponStats stats = WeaponStats.For(WeaponId.RocketLauncher);
+                Vector3 fwd = new Vector3(aim.x - _predictedX, 0f, aim.z - _predictedZ).normalized;
+                Vector3 right = new Vector3(fwd.z, 0f, -fwd.x);
+                origin = new Vector3(_predictedX, EntityY, _predictedZ)
+                       + fwd * stats.MuzzleForwardMeters + right * stats.MuzzleRightMeters;
+            }
+
+            // Same rule as the server in XZ: muzzle -> aim point at the rocket speed.
+            // Height is OURS — the server has no Y at all — and the rocket must pass
+            // through the exact 3D point under the crosshair, like the bullets do. So
+            // the visual climbs or dips linearly until it crosses the aim point, then
+            // flies level. The XZ speed never changes, so the explosion the server
+            // sends still lands where the visual has got to.
+            Vector3 flat = new Vector3(aim.x - origin.x, 0f, aim.z - origin.z);
+            Vector3 direction = flat.sqrMagnitude > 0.0001f
+                ? flat.normalized
+                : new Vector3(aim.x - _predictedX, 0f, aim.z - _predictedZ).normalized;
+            float climb = flat.magnitude;
+            bool hasClimb = climb > 0.05f;
+
+            // The flight has a known end: the server detonates at the aim point
+            // ("shooting the ground") or on the first wall, whichever is nearer, and
+            // walls do not move. Both are computable HERE, from the shared geometry —
+            // so the visual can stop exactly where its rocket is going to die instead
+            // of sailing past its own explosion while the event is still in transit.
+            // (A player stepping into the path still detonates earlier than this; the
+            // event cleans that up.)
+            float geometry = Raycast.ArenaHitDistance(origin.x, origin.z, direction.x, direction.z);
+            float stop = hasClimb ? Mathf.Min(climb, geometry) : geometry;
+
+            GameObject go = BuildRocketModel(aim - origin, "Rocket (predicted)");
+            go.transform.position = origin;
+            _predictedRockets.Add(new PredictedRocket
+            {
+                Go = go,
+                Position = origin,
+                DirectionXZ = direction,
+                ClimbXZ = hasClimb ? climb : 0f,
+                StartY = origin.y,
+                TargetY = hasClimb ? aim.y : origin.y,
+                StopXZ = stop,
+            });
+        }
+
+        /// <summary>
+        /// Flies the predicted rockets — including adopted ones, which keep driving
+        /// their own view for the whole flight so the hand-off from prediction to
+        /// authority never shows as a backwards jump. An unmatched one that the
+        /// server never confirms times out; one whose entity despawned finds its
+        /// GameObject already destroyed and drops the record.
+        /// </summary>
+        private void UpdatePredictedRockets()
+        {
+            for (int i = _predictedRockets.Count - 1; i >= 0; i--)
+            {
+                PredictedRocket rocket = _predictedRockets[i];
+                if (rocket.Go == null)
+                {
+                    _predictedRockets.RemoveAt(i); // entity despawned; view went with it
+                    continue;
+                }
+
+                if (rocket.Detonated)
+                {
+                    // Already exploded on screen; only waiting for the server's event
+                    // to retire the (hidden) view. An unconfirmed one still times out.
+                    if (!rocket.Matched)
+                    {
+                        rocket.Age += Time.deltaTime;
+                        if (rocket.Age > PredictedRocketTimeoutSeconds)
+                        {
+                            Destroy(rocket.Go);
+                            _predictedRockets.RemoveAt(i);
+                        }
+                    }
+                    continue;
+                }
+
+                // Never overshoot the flight's known end (aim point or first wall).
+                float step = GameConstants.ResolveRocketSpeed() * Time.deltaTime;
+                if (rocket.TraveledXZ + step > rocket.StopXZ)
+                    step = Mathf.Max(0f, rocket.StopXZ - rocket.TraveledXZ);
+                rocket.TraveledXZ += step;
+                rocket.Position += rocket.DirectionXZ * step;
+
+                // Climb (or dip) toward the aimed height until the aim point is
+                // crossed, then level off. Height is pure rendering — XZ is what the
+                // server simulates, and it moved the full step above.
+                bool climbing = rocket.ClimbXZ > 0f && rocket.TraveledXZ < rocket.ClimbXZ;
+                float y = climbing
+                    ? Mathf.Lerp(rocket.StartY, rocket.TargetY, rocket.TraveledXZ / rocket.ClimbXZ)
+                    : rocket.TargetY;
+                rocket.Position = new Vector3(rocket.Position.x, y, rocket.Position.z);
+                rocket.Go.transform.position = rocket.Position;
+                rocket.Go.transform.rotation = Quaternion.LookRotation(climbing
+                    ? rocket.DirectionXZ * rocket.ClimbXZ + Vector3.up * (rocket.TargetY - rocket.StartY)
+                    : rocket.DirectionXZ);
+
+                // Reached the end: explode NOW, on our own clock. The end is
+                // predictable — the aim point and the walls are the same on both
+                // sides — so the effect is too; the server still decides the damage,
+                // and its event only retires the view (a player stepping into the path
+                // is the one case it differs, handled when the event arrives).
+                if (rocket.TraveledXZ >= rocket.StopXZ - 0.001f)
+                {
+                    SpawnRocketExplosion(rocket.Position);
+                    rocket.Detonated = true;
+                    rocket.Go.SetActive(false);
+                    continue;
+                }
+
+                if (rocket.Matched)
+                    continue;
+
+                rocket.Age += Time.deltaTime;
+                if (rocket.Age > PredictedRocketTimeoutSeconds)
+                {
+                    Destroy(rocket.Go);
+                    _predictedRockets.RemoveAt(i);
+                }
+            }
+        }
+
+        private PredictedRocket PredictedRocketFor(ushort entityId)
+        {
+            foreach (PredictedRocket rocket in _predictedRockets)
+                if (rocket.Matched && rocket.EntityId == entityId)
+                    return rocket;
+            return null;
+        }
+
+        private PredictedRocket OldestUnmatchedPredictedRocket()
+        {
+            foreach (PredictedRocket rocket in _predictedRockets)
+                if (!rocket.Matched && rocket.Go != null)
+                    return rocket;
+            return null;
+        }
+
+        /// <summary>
+        /// The rockets in a snapshot. Our own rocket ADOPTS the visual we predicted on
+        /// the click; anyone else's gets a view at the height of the barrel it came
+        /// out of, fed into an interpolation buffer like a remote player.
+        /// </summary>
+        private void ApplyRocketSnapshot(SnapshotPacket snapshot)
+        {
+            List<ushort> liveRocketIds = new List<ushort>();
+            foreach (RocketEntityState rocket in snapshot.Rockets)
+            {
+                liveRocketIds.Add(rocket.EntityId);
+
+                // Already ended by its explosion event — this snapshot was sent
+                // before the detonation and only arrived after it.
+                if (_explodedRockets.Contains(rocket.EntityId))
+                    continue;
+
+                if (!_rocketViews.TryGetValue(rocket.EntityId, out GameObject view))
+                {
+                    // Our own rocket? The player already watched it leave the barrel
+                    // the moment they clicked — the entity arriving a round trip
+                    // later ADOPTS that visual instead of spawning a second one a few
+                    // metres back. The predicted flight keeps driving it (flagged
+                    // self-driven, skipped by interpolation); the server still owns
+                    // when and where it explodes.
+                    PredictedRocket predicted = rocket.OwnerId == _client.PlayerId
+                        ? OldestUnmatchedPredictedRocket()
+                        : null;
+                    if (predicted != null)
+                    {
+                        view = predicted.Go;
+                        predicted.Matched = true;
+                        predicted.EntityId = rocket.EntityId;
+                        _selfDrivenRockets.Add(rocket.EntityId);
+                        _rocketHeights[rocket.EntityId] = predicted.Position.y;
+                    }
+                    else
+                    {
+                        view = CreateRocketView(rocket);
+
+                        // Fly at the height of the barrel it came out of. The server
+                        // has no Y at all — it placed the rocket at the muzzle in XZ,
+                        // and this is the rendering half of the same answer. Read
+                        // once, at spawn: the shooter's hand keeps moving, the rocket
+                        // does not follow it.
+                        _rocketHeights[rocket.EntityId] = MuzzleHeightOf(rocket.OwnerId);
+
+                        // Seed the view at the first known position so it does not
+                        // flash at the origin before the interpolator has two samples.
+                        view.transform.position = new Vector3(
+                            rocket.X, _rocketHeights[rocket.EntityId], rocket.Z);
+                    }
+                    _rocketViews[rocket.EntityId] = view;
+                }
+                if (!_remoteBuffers.TryGetValue(rocket.EntityId, out InterpolationBuffer rocketBuffer))
+                    _remoteBuffers[rocket.EntityId] = rocketBuffer = new InterpolationBuffer();
+                rocketBuffer.Add(snapshot.ServerTick, rocket.X, rocket.Z);
+            }
+
+            List<ushort> stale = new List<ushort>();
+            foreach (ushort id in _rocketViews.Keys)
+                if (!liveRocketIds.Contains(id))
+                    stale.Add(id);
+            foreach (ushort id in stale)
+            {
+                Destroy(_rocketViews[id]);
+                _rocketViews.Remove(id);
+            }
+
+            // Rocket buffers and heights go with their entity.
+            List<ushort> deadBuffers = new List<ushort>();
+            foreach (ushort id in _remoteBuffers.Keys)
+                if (!_playerViews.ContainsKey(id) && !_rocketViews.ContainsKey(id))
+                    deadBuffers.Add(id);
+            foreach (ushort id in deadBuffers)
+                _remoteBuffers.Remove(id);
+            foreach (ushort id in new List<ushort>(_rocketHeights.Keys))
+                if (!liveRocketIds.Contains(id))
+                    _rocketHeights.Remove(id);
+            _selfDrivenRockets.RemoveWhere(id => !liveRocketIds.Contains(id));
+
+            // First snapshot without the rocket: the ghost window is over, and the
+            // sequence check keeps every older snapshot out from here on.
+            _explodedRockets.RemoveWhere(id => !liveRocketIds.Contains(id));
+        }
+
+        /// <summary>Positions the other players' rockets from their buffers, on the
+        /// same past render clock as the remote players.</summary>
+        private void UpdateRemoteRocketViews()
+        {
+            foreach (KeyValuePair<ushort, GameObject> entry in _rocketViews)
+            {
+                // A rocket we predicted flies itself (UpdatePredictedRockets); letting
+                // the interpolator touch it would snap it a round trip backwards.
+                if (_selfDrivenRockets.Contains(entry.Key))
+                    continue;
+                if (!_remoteBuffers.TryGetValue(entry.Key, out InterpolationBuffer rocketBuffer))
+                    continue;
+
+                float x, z;
+                bool has = EnableInterpolation
+                    ? rocketBuffer.TrySample(_renderTick, out x, out z)
+                    : rocketBuffer.TryLatest(out x, out z);
+                if (has)
+                {
+                    float y = _rocketHeights.TryGetValue(entry.Key, out float muzzleY) ? muzzleY : EntityY;
+                    entry.Value.transform.position = new Vector3(x, y, z);
+                }
+            }
+        }
+
+        /// <summary>
+        /// The server says a rocket blew up. Explode at the height the rocket was
+        /// DRAWN at — the event carries XZ, because that is all the server has — and
+        /// take its view down with it. Our own rocket usually exploded on screen
+        /// already, the moment it reached its known end; the server's bang only plays
+        /// if that did not happen, or if the rocket died somewhere else (a player
+        /// stepped into the path, the one end the client could not foresee).
+        /// </summary>
+        private void HandleRocketExploded(RocketExploded exploded)
+        {
+            float boomY;
+            if (_rocketViews.TryGetValue(exploded.RocketEntityId, out GameObject exploding) &&
+                exploding != null)
+                boomY = exploding.transform.position.y;
+            else if (!_rocketHeights.TryGetValue(exploded.RocketEntityId, out boomY))
+                boomY = EntityY;
+
+            // A rocket fired point-blank can detonate on the very tick it spawned and
+            // never appear in any snapshot. Our predicted visual is then the only
+            // trace of it — this event is its end.
+            PredictedRocket own = null;
+            if (exploded.OwnerId == _client.PlayerId &&
+                !_rocketViews.ContainsKey(exploded.RocketEntityId))
+            {
+                PredictedRocket orphan = OldestUnmatchedPredictedRocket();
+                if (orphan != null)
+                {
+                    own = orphan;
+                    boomY = orphan.Position.y;
+                    Destroy(orphan.Go);
+                    _predictedRockets.Remove(orphan);
+                }
+            }
+            else if (exploded.OwnerId == _client.PlayerId)
+            {
+                own = PredictedRocketFor(exploded.RocketEntityId);
+            }
+
+            bool alreadyShown = own != null && own.Detonated &&
+                new Vector2(own.Position.x - exploded.X, own.Position.z - exploded.Z).sqrMagnitude
+                    < LocalDetonationToleranceMeters * LocalDetonationToleranceMeters;
+            if (!alreadyShown)
+                SpawnRocketExplosion(new Vector3(exploded.X, boomY, exploded.Z));
+
+            // The event IS the end of this rocket — take the view down with it.
+            // Waiting for the despawn snapshot left the visual flying on for a beat
+            // after its own explosion.
+            if (exploding != null)
+            {
+                Destroy(exploding);
+                _rocketViews.Remove(exploded.RocketEntityId);
+            }
+            _rocketHeights.Remove(exploded.RocketEntityId);
+            _selfDrivenRockets.Remove(exploded.RocketEntityId);
+            _explodedRockets.Add(exploded.RocketEntityId);
+            PlayerFeed?.Invoke($"boom! rocket exploded at ({exploded.X:F0}, {exploded.Z:F0})");
+        }
+
+        private GameObject CreateRocketView(RocketEntityState rocket)
+            => BuildRocketModel(new Vector3(rocket.DirectionX, 0f, rocket.DirectionZ),
+                $"Rocket {rocket.EntityId}");
+
+        /// <summary>
+        /// A rocket visual: the model the launcher itself says it fires
+        /// (<see cref="WeaponGrip.ProjectilePrefab"/>), pointed along its flight
+        /// direction. The weapon owns this the same way it owns how it sits in a
+        /// hand — no projectile is configured anywhere in the netcode. With no model
+        /// assigned we fall back to a plain sphere, which is unmistakably a
+        /// placeholder rather than something that might pass for art.
+        ///
+        /// The prefab's own scale is kept. Overriding it is how a correctly-sized
+        /// model ends up invisible.
+        /// </summary>
+        private GameObject BuildRocketModel(Vector3 direction, string name)
+        {
+            Quaternion facing = direction.sqrMagnitude > 0.000001f
+                ? Quaternion.LookRotation(direction)
+                : Quaternion.identity;
+
+            GameObject prefab = RocketProjectilePrefab();
+            if (prefab != null)
+            {
+                GameObject view = Instantiate(prefab, Vector3.zero, facing);
+                view.name = name;
+                // It is a picture of simulation state, not a thing in the scene: it
+                // must not collide, and it must not drift on its own.
+                foreach (Collider collider in view.GetComponentsInChildren<Collider>())
+                    Destroy(collider);
+                foreach (HoverAndRotate hover in view.GetComponentsInChildren<HoverAndRotate>())
+                    Destroy(hover);
+                return view;
+            }
+
+            GameObject placeholder = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+            placeholder.name = name + " (no projectile model)";
+            placeholder.transform.localScale = Vector3.one * 0.35f;
+            placeholder.transform.rotation = facing;
+            Destroy(placeholder.GetComponent<Collider>());
+            placeholder.GetComponent<Renderer>().material.color = Color.red;
+            return placeholder;
+        }
+
+        /// <summary>The rocket launcher's projectile model. A Rocket entity is by
+        /// definition what the rocket launcher fires, so this does not depend on what
+        /// the owner happens to be holding by the time we see it.</summary>
+        private static GameObject RocketProjectilePrefab()
+        {
+            GameObject held = PickupMarker.HeldPrefabFor(WeaponId.RocketLauncher);
+            WeaponGrip grip = held != null ? held.GetComponent<WeaponGrip>() : null;
+            return grip != null ? grip.ProjectilePrefab : null;
+        }
+
+        /// <summary>
+        /// What a rocket leaves behind: the launcher's own hit effect, carried on the
+        /// weapon's <see cref="WeaponGrip.HitEffectPrefab"/> exactly like the bullet
+        /// weapons carry their hit sparks there. With nothing assigned we fall back to
+        /// the code-built placeholder sphere (the OTHER ExplosionEffect, in this
+        /// assembly — the ported art lives in Gameplay under the same name).
+        /// </summary>
+        private void SpawnRocketExplosion(Vector3 position)
+        {
+            GameObject held = PickupMarker.HeldPrefabFor(WeaponId.RocketLauncher);
+            WeaponGrip grip = held != null ? held.GetComponent<WeaponGrip>() : null;
+            if (grip != null)
+                SpatialAudio.Play(grip.ImpactSounds, position, grip.ImpactVolume);
+            GameObject prefab = grip != null ? grip.HitEffectPrefab : null;
+            if (prefab == null)
+            {
+                ExplosionEffect.Spawn(position);
+                return;
+            }
+
+            GameObject boom = Instantiate(prefab, position, Quaternion.identity);
+
+            // The ported effect builds its particle systems stopped and waits for
+            // Play() — an effect that fires in Awake would flash at the prefab's
+            // authoring position for one frame first.
+            foreach (Gameplay.ExplosionEffect effect in
+                     boom.GetComponentsInChildren<Gameplay.ExplosionEffect>())
+                effect.Play();
+        }
+
+        /// <summary>World Y of a player's muzzle, or the default entity height when
+        /// they have no weapon model (or we have no view of them yet).</summary>
+        private float MuzzleHeightOf(byte playerId)
+        {
+            if (_characterVisuals.TryGetValue(playerId, out CharacterVisual visual) && visual != null &&
+                visual.TryGetMuzzle(out Vector3 muzzle))
+                return muzzle.y;
+            return EntityY;
         }
     }
 }

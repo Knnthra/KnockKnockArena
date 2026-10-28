@@ -39,4 +39,39 @@ namespace KnockKnockArena.Shared.Protocol.Messages
             });
         }
     }
+
+    /// <summary>
+    /// Server -> all clients. A rocket detonated (play the explosion effect here —
+    /// the entity also disappears from the snapshot).
+    /// Payload: [version:byte] [rocketEntityId:ushort] [x:float] [z:float] [ownerId:byte]
+    /// </summary>
+    public sealed class RocketExploded
+    {
+        public ushort RocketEntityId;
+        public float X;
+        public float Z;
+        public byte OwnerId;
+
+        public byte[] ToPayload()
+        {
+            return ProtocolSerialization.WritePayload(writer =>
+            {
+                writer.Write(RocketEntityId);
+                writer.Write(X);
+                writer.Write(Z);
+                writer.Write(OwnerId);
+            });
+        }
+
+        public static RocketExploded FromPayload(byte[] payload)
+        {
+            return ProtocolSerialization.ReadPayload(payload, reader => new RocketExploded
+            {
+                RocketEntityId = reader.ReadUInt16(),
+                X = reader.ReadSingle(),
+                Z = reader.ReadSingle(),
+                OwnerId = reader.ReadByte(),
+            });
+        }
+    }
 }

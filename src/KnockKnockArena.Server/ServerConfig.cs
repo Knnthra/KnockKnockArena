@@ -5,7 +5,8 @@ namespace KnockKnockArena.Server;
 /// <summary>
 /// Server configuration, from command-line arguments:
 ///
-///   args: --port N, --max-players N, --name TEXT, --map PATH, --weapons PATH, --verbose
+///   args: --port N, --max-players N, --name TEXT, --map PATH, --weapons PATH,
+///         --pickups PATH, --verbose
 /// </summary>
 public sealed class ServerConfig
 {
@@ -24,6 +25,10 @@ public sealed class ServerConfig
 
     /// <summary>The weapon table (M08): damage, cooldown, spread - balance as data.</summary>
     public string WeaponsPath { get; private set; } = "data/weapons.json";
+
+    /// <summary>The pickup table (M09): the pickup radius per type. Optional - without
+    /// it every pickup keeps the default radius.</summary>
+    public string PickupsPath { get; private set; } = "data/pickups.json";
 
     public bool Verbose { get; private set; }
 
@@ -55,12 +60,16 @@ public sealed class ServerConfig
                     config.WeaponsPath = args[i + 1];
                     i++;
                     break;
+                case "--pickups" when i + 1 < args.Length:
+                    config.PickupsPath = args[i + 1];
+                    i++;
+                    break;
                 case "--verbose":
                     config.Verbose = true;
                     break;
                 default:
                     throw new ArgumentException($"Unknown argument '{args[i]}'. " +
-                        "Usage: --port N --max-players N --name TEXT --map PATH --weapons PATH --verbose");
+                        "Usage: --port N --max-players N --name TEXT --map PATH --weapons PATH --pickups PATH --verbose");
             }
         }
 

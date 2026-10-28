@@ -232,6 +232,7 @@ public sealed class TcpGameServer
         lock (_clientsGate)
             snapshot = _clients.ToArray();
 
+        int sent = 0;
         foreach (ClientConnection client in snapshot)
         {
             if (client == except || client.Session == null)
@@ -239,6 +240,7 @@ public sealed class TcpGameServer
             try
             {
                 client.Send(type, payload);
+                sent++;
             }
             catch
             {
@@ -246,6 +248,7 @@ public sealed class TcpGameServer
                 // and run the disconnect path; nothing more to do here.
             }
         }
+        Log.Info($"SEND {type} ({payload.Length} B) to {sent} client{(sent == 1 ? "" : "s")}");
     }
 
     private void Disconnect(ClientConnection connection, string reason)
@@ -307,6 +310,19 @@ public sealed class TcpGameServer
         }
     }
 
+    /// <summary>Kill feed: broadcast a PlayerDied event to every logged-in client.</summary>
+    public void BroadcastPlayerDied(byte killerId, string killerName, byte victimId, string victimName, byte weaponId)
+    {
+        Broadcast(MessageType.PlayerDied, new PlayerDied
+        {
+            KillerId = killerId,
+            KillerUsername = killerName,
+            VictimId = victimId,
+            VictimUsername = victimName,
+            WeaponId = weaponId,
+        }.ToPayload());
+    }
+
     /// <summary>Broadcast a PickupTaken event to every logged-in client.</summary>
     public void BroadcastPickupTaken(byte playerId, string username, byte pickupId, byte pickupType)
     {
@@ -316,6 +332,37 @@ public sealed class TcpGameServer
             Username = username,
             PickupId = pickupId,
             Type = (Shared.Protocol.Udp.PickupType)pickupType,
+        }.ToPayload());
+    }
+
+    /// <summary>Broadcast a RocketExploded event to every logged-in client.</summary>
+    public void BroadcastRocketExploded(ushort rocketEntityId, float x, float z, byte ownerId)
+    {
+        Broadcast(MessageType.RocketExploded, new RocketExploded
+        {
+            RocketEntityId = rocketEntityId,
+            X = x,
+            Z = z,
+            OwnerId = ownerId,
+        }.ToPayload());
+    }
+
+    /// <summary>
+    /// Announces damage and WHERE it landed. Broadcast, not sent to the victim
+    /// alone: everyone watching a fight should see the blood, not just the person
+    /// bleeding.
+    /// </summary>
+    public void BroadcastPlayerDamaged(byte victimId, float x, float z,
+        byte attackerId, byte weaponId, byte damage)
+    {
+        Broadcast(MessageType.PlayerDamaged, new PlayerDamaged
+        {
+            VictimId = victimId,
+            X = x,
+            Z = z,
+            AttackerId = attackerId,
+            WeaponId = weaponId,
+            Damage = damage,
         }.ToPayload());
     }
 }

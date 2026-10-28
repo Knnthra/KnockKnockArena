@@ -17,6 +17,9 @@ namespace KnockKnockArena.Shared.Protocol
         ChatBroadcast = 102,
         PlayerJoined = 103,
         PlayerLeft = 104,
-        PickupTaken = 106,  // M07; 105 (PlayerDied) comes with death in M09
+        PlayerDied = 105,
+        PickupTaken = 106,
+        RocketExploded = 107,
+        PlayerDamaged = 108,
     }
 }

@@ -3,6 +3,20 @@ using System.IO;
 
 namespace KnockKnockArena.Shared.Protocol.Udp
 {
+    /// <summary>A rocket in flight. Interpolate it like a player.</summary>
+    public sealed class RocketEntityState
+    {
+        public ushort EntityId;
+        public float X;
+        public float Z;
+
+        /// <summary>Normalized flight direction (constant for the rocket's lifetime).</summary>
+        public float DirectionX;
+        public float DirectionZ;
+
+        public byte OwnerId;
+    }
+
     /// <summary>A pickup spot. Position comes from the published map data — the
     /// snapshot only says whether it is currently there to take.</summary>
     public sealed class PickupEntityState
@@ -25,8 +39,6 @@ namespace KnockKnockArena.Shared.Protocol.Udp
     ///           then per entity: [entityId:ushort] [entityType:byte] [type-specific data]
     ///
     /// Player entity: see PlayerEntityState, which serializes itself (39 bytes).
-    /// Pickup entity: [entityId:ushort] [entityType:byte = 3] [pickupType:byte] [active:bool] (5 bytes).
-    /// Module 7: players and pickups. Rockets join the snapshot in M09.
     /// </summary>
     public sealed class SnapshotPacket
     {
@@ -39,6 +51,7 @@ namespace KnockKnockArena.Shared.Protocol.Udp
         public uint LastProcessedInputIndex;
 
         public List<PlayerEntityState> Players = new List<PlayerEntityState>();
+        public List<RocketEntityState> Rockets = new List<RocketEntityState>();
         public List<PickupEntityState> Pickups = new List<PickupEntityState>();
 
         public byte[] ToDatagram()
@@ -48,9 +61,19 @@ namespace KnockKnockArena.Shared.Protocol.Udp
                 writer.Write(Sequence);
                 writer.Write(ServerTick);
                 writer.Write(LastProcessedInputIndex);
-                writer.Write((byte)(Players.Count + Pickups.Count));
+                writer.Write((byte)(Players.Count + Rockets.Count + Pickups.Count));
                 foreach (PlayerEntityState player in Players)
                     player.WriteTo(writer);
+                foreach (RocketEntityState rocket in Rockets)
+                {
+                    writer.Write(rocket.EntityId);
+                    writer.Write((byte)EntityType.Rocket);
+                    writer.Write(rocket.X);
+                    writer.Write(rocket.Z);
+                    writer.Write(rocket.DirectionX);
+                    writer.Write(rocket.DirectionZ);
+                    writer.Write(rocket.OwnerId);
+                }
                 foreach (PickupEntityState pickup in Pickups)
                 {
                     writer.Write(pickup.EntityId);
@@ -81,6 +104,17 @@ namespace KnockKnockArena.Shared.Protocol.Udp
                     {
                         case EntityType.Player:
                             snapshot.Players.Add(PlayerEntityState.ReadData(reader, entityId));
+                            break;
+                        case EntityType.Rocket:
+                            snapshot.Rockets.Add(new RocketEntityState
+                            {
+                                EntityId = entityId,
+                                X = reader.ReadSingle(),
+                                Z = reader.ReadSingle(),
+                                DirectionX = reader.ReadSingle(),
+                                DirectionZ = reader.ReadSingle(),
+                                OwnerId = reader.ReadByte(),
+                            });
                             break;
                         case EntityType.Pickup:
                             snapshot.Pickups.Add(new PickupEntityState
