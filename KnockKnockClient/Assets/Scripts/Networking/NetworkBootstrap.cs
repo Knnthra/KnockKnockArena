@@ -2,6 +2,8 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using KnockKnockArena.Gameplay;
+using KnockKnockArena.Shared.Config;
+using KnockKnockArena.Shared.Protocol;
 using KnockKnockArena.Shared.Protocol.Messages;
 using KnockKnockArena.Shared.Protocol.Udp;
 using KnockKnockArena.Shared.Simulation;
@@ -29,6 +31,15 @@ namespace KnockKnockArena.Networking
     /// swings on the click. The rocket is predicted locally on the click and drawn
     /// from the snapshot for everyone else; RocketExploded ends it.
     ///
+    /// MODULE 10: REST and distributed design. Before it touches the game ports the
+    /// client fetches the arena and the weapon table from the server's REST API
+    /// (GET /api/config) — one source of truth instead of two copies that have to be
+    /// kept in step by hand. The scene's own arena is only a CLAIM now: its hash is
+    /// checked against the server's, so a map mismatch is caught at connect with a
+    /// message naming both maps, instead of showing up later as bitMismatches.
+    /// The server browser asks each listed server for GET /api/status, and Quick join
+    /// picks the fullest compatible server that still has room.
+    ///
     /// The dev UI is NetworkHud (handed out): it only reads the public properties
     /// below, listens to the two events and calls the public methods. Nothing here
     /// draws IMGUI; the crosshair, the weapon bar and the status HUD are the base
@@ -41,6 +52,16 @@ namespace KnockKnockArena.Networking
         public int Port = 36363;
         public string Username = "test";
         public string Password = "test";
+
+        [Header("REST")]
+        [Tooltip("The server's HTTP port (its REST API). /api/config is fetched from here " +
+                 "before the game ports are touched.")]
+        public int HttpPort = 8080;
+
+        [Header("Finding servers")]
+        [Tooltip("Server browser (M10): host:httpPort entries, comma separated. Each one is " +
+                 "asked for GET /api/status when you press Browse.")]
+        public string ServerBrowserList = "localhost:8080";
 
         [Header("Debug")]
         [Tooltip("Delay on all UDP traffic, each way, in ms. 2x this = simulated round trip.")]
@@ -60,11 +81,6 @@ namespace KnockKnockArena.Networking
         [Tooltip("Render other players a few ticks in the past, blended between " +
                  "snapshots. Off = jump to the newest snapshot (visible teleporting).")]
         public bool EnableInterpolation = true;
-
-        [Header("Game data")]
-        [Tooltip("weapons.json: a LOCAL copy of the server's data/weapons.json (M08). " +
-                 "Both sides read it with the same shared parser; M10 fetches it from the server.")]
-        public TextAsset WeaponTable;
 
         [Header("Gameplay couplings")]
         public CursorAim AimSource;
@@ -151,6 +167,12 @@ namespace KnockKnockArena.Networking
         public bool IsTyping { get; set; }
 
         private NetworkClient _client;
+
+        // The arena this scene was baked with (from its ArenaMapStamp) and the one the
+        // server turned out to be running. They have to be the same map, or what the
+        // player can see is not what stops them — see TryApplyServerConfig.
+        private uint? _bakedMapHash;
+        private uint? _serverMapHash;
 
         // Player id -> username, built from PlayerJoined events. The server replays
         // the roster on login, so players who were already online are covered too.
@@ -263,24 +285,31 @@ namespace KnockKnockArena.Networking
 
         private void Start()
         {
-            // The weapon table: a LOCAL copy of the server's data/weapons.json, read with
-            // the same shared parser. Like the arena, the two sides agree only because
-            // the two files are the same; M10 fetches both from the server.
-            if (WeaponTable != null)
-                WeaponStats.Load(WeaponStats.ParseTable(WeaponTable.text));
-            else
-                Debug.LogError($"{name}: no weapons.json assigned — copy data/weapons.json into the project " +
-                               "and drag it onto Weapon Table", this);
             // The login menu needs the mouse: no crosshair and no weapon bar until we are in the game
             if (Crosshair != null)
                 Crosshair.SetVisible(false);
             if (ActionBar != null)
                 ActionBar.gameObject.SetActive(false);
 
-            // The scene's ArenaMapStamp loaded the arena in Awake: bind its pickups now,
-            // so they are there before anyone connects.
-            if (ArenaMap.IsLoaded && !_pickupViewsCreated)
-                CreatePickupViews();
+            // The weapon table is not loaded here: it comes from the server's /api/config
+            // at connect (FetchConfigThenConnect), like the arena.
+            //
+            // The scene's ArenaMapStamp loaded the arena in Awake. That is the scene's
+            // CLAIM of which map it shows: remember its fingerprint, because at connect
+            // it is what the server's arena is checked against. Bind its pickups now,
+            // so they are there before anyone connects. Without a stamp there is
+            // nothing to check against, and the server's map is taken on trust.
+            if (ArenaMap.IsLoaded)
+            {
+                _bakedMapHash = ArenaMap.Hash;
+                if (!_pickupViewsCreated)
+                    CreatePickupViews();
+            }
+            else
+            {
+                StatusLine = "No arena in this scene — the server's map will be used as-is. " +
+                             "Bake the map to stamp this scene and get mismatch detection.";
+            }
         }
 
         private void Update()
@@ -326,9 +355,97 @@ namespace KnockKnockArena.Networking
         public void Connect()
         {
             IsConnecting = true;
-            StatusLine = $"Connecting to {Host}:{Port}...";
+            StartCoroutine(FetchConfigThenConnect());
+        }
+
+        // ------------------------------------------------------------- the config lookup (REST)
+
+        /// <summary>How long a REST call may take before the client gives up with a
+        /// message, instead of waiting forever on a server that never answers.</summary>
+        private const int RestTimeoutSeconds = 5;
+
+        /// <summary>
+        /// The config lookup. Before touching the game ports, ask the REST API what
+        /// this server is running and load it with the SHARED parsers — the same code
+        /// the server used, so the two sides end up with the same floats and
+        /// prediction has something to be right about. Only then is the TCP/UDP
+        /// client created.
+        /// </summary>
+        private IEnumerator FetchConfigThenConnect()
+        {
+            StatusLine = $"Fetching server config from {Host}:{HttpPort}...";
+
+            string url = $"http://{Host}:{HttpPort}/api/config";
+            using (UnityEngine.Networking.UnityWebRequest request =
+                   UnityEngine.Networking.UnityWebRequest.Get(url))
+            {
+                request.timeout = RestTimeoutSeconds; // a silent server ends in a message, not a hang
+                yield return request.SendWebRequest();
+
+                if (request.result != UnityEngine.Networking.UnityWebRequest.Result.Success)
+                {
+                    Disconnect($"Could not fetch {url}: {request.error}");
+                    yield break;
+                }
+
+                if (!TryApplyServerConfig(request.downloadHandler.text, out string configError))
+                {
+                    Disconnect($"Server config rejected: {configError}");
+                    yield break;
+                }
+            }
+
             _client = new NetworkClient { SimulatedLatencyMs = SimulatedLatencyMs, SimulatedJitterMs = SimulatedJitterMs };
+            StatusLine = $"Connecting to {Host}:{Port}...";
             _client.ConnectAndLogin(Host, Port, Username, Password);
+        }
+
+        /// <summary>
+        /// Loads the arena and weapon table out of a /api/config response. Returns
+        /// false with a reason rather than throwing, so a bad config shows up as a
+        /// refused connection with an explanation on screen.
+        ///
+        /// The arena in this scene was already loaded by its ArenaMapStamp, so what
+        /// matters here is whether the server agrees with it. Rather than trust the
+        /// name, parse the server's copy and compare hashes: the hash is taken over
+        /// the parsed bits, so it catches both "different map" and the subtler "same
+        /// file, different floats".
+        /// </summary>
+        private bool TryApplyServerConfig(string json, out string error)
+        {
+            try
+            {
+                JsonValue config = Json.Parse(json);
+                ArenaMapData serverMap = ArenaMapData.Parse(config["arena"].AsString());
+                WeaponStats[] weapons = WeaponStats.ParseTable(config["weapons"].AsString());
+
+                // Compare against the map this scene was baked from BEFORE adopting the
+                // server's copy, so the message can name both sides.
+                if (_bakedMapHash.HasValue && _bakedMapHash.Value != serverMap.Hash)
+                {
+                    error = $"this client is showing \"{ArenaMap.Name}\" " +
+                            $"({ArenaMapData.FormatHash(_bakedMapHash.Value)}) but the server is " +
+                            $"simulating \"{serverMap.Name}\" ({ArenaMapData.FormatHash(serverMap.Hash)}). " +
+                            "Re-bake the map, or point the server at the same arena.json.";
+                    return false;
+                }
+
+                ArenaMap.Load(serverMap);
+                WeaponStats.Load(weapons);
+                _serverMapHash = serverMap.Hash;
+
+                // A scene with no stamp had no pickups to bind at Start; now it does.
+                if (!_pickupViewsCreated)
+                    CreatePickupViews();
+
+                error = "";
+                return true;
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                return false;
+            }
         }
 
         public void Disconnect(string reason)
@@ -338,6 +455,7 @@ namespace KnockKnockArena.Networking
             IsConnecting = false;
             StatusLine = reason;
             ServerInfoLine = "";
+            _serverMapHash = null;
             _usernames.Clear();
 
             _inputAccumulator = 0f;
@@ -456,10 +574,117 @@ namespace KnockKnockArena.Networking
             }.Start();
         }
 
-        public void JoinLanServer(DiscoveredServer server)
+        // ------------------------------------------------------------- server browser (REST)
+
+        /// <summary>One row in the server browser: the listed entry, and either the
+        /// instance's status or why there is none.</summary>
+        public sealed class BrowserEntry
         {
-            Host = server.Address.ToString();
-            Port = server.Info.GamePort;
+            public string Label = "";
+            public string Host = "";
+            public int HttpPort;
+            public ServerStatus Status;   // null when the instance did not answer
+            public string Error = "";
+        }
+
+        private List<BrowserEntry> _browserResults = new List<BrowserEntry>();
+        private string _browserStatus = "";
+        private bool _browsing;
+
+        // What the HUD shows of the browser. Only this class sets them.
+        public IReadOnlyList<BrowserEntry> BrowserResults => _browserResults;
+        public string BrowserStatus => _browserStatus;
+        public bool IsBrowsing => _browsing;
+
+        /// <summary>Browse (the HUD's button): runs <see cref="BrowseServers"/> as a
+        /// coroutine, so the panel keeps drawing while the servers answer.</summary>
+        public void StartBrowse()
+        {
+            StartCoroutine(BrowseServers());
+        }
+
+        /// <summary>Quick join (the HUD's button): runs <see cref="QuickJoin"/> as a
+        /// coroutine.</summary>
+        public void StartQuickJoin()
+        {
+            StartCoroutine(QuickJoin());
+        }
+
+        /// <summary>
+        /// Server browser: ask every host:httpPort in the list for GET /api/status,
+        /// one after the other. No protocol change — the REST API already describes
+        /// each instance. This is how servers beyond the LAN are found: broadcasts
+        /// stop at the router.
+        /// </summary>
+        private IEnumerator BrowseServers()
+        {
+            _browsing = true;
+            _browserStatus = "Asking the listed servers...";
+            List<BrowserEntry> results = new List<BrowserEntry>();
+            foreach (string raw in ServerBrowserList.Split(','))
+            {
+                if (raw.Trim().Length == 0)
+                    continue;
+                BrowserEntry entry = new BrowserEntry { Label = raw.Trim() };
+                results.Add(entry);
+                if (!ServerStatus.TryParseEntry(raw, out entry.Host, out entry.HttpPort))
+                {
+                    entry.Error = "not host[:httpPort]";
+                    continue;
+                }
+
+                string url = $"http://{entry.Host}:{entry.HttpPort}/api/status";
+                using (UnityEngine.Networking.UnityWebRequest request = UnityEngine.Networking.UnityWebRequest.Get(url))
+                {
+                    request.timeout = RestTimeoutSeconds;
+                    yield return request.SendWebRequest();
+                    if (request.result != UnityEngine.Networking.UnityWebRequest.Result.Success)
+                    {
+                        entry.Error = request.error;
+                        continue;
+                    }
+                    try
+                    {
+                        entry.Status = ServerStatus.Parse(request.downloadHandler.text);
+                    }
+                    catch (JsonException ex)
+                    {
+                        entry.Error = $"not a KnockKnock status: {ex.Message}";
+                    }
+                }
+            }
+            _browserResults = results;
+            _browserStatus = $"{results.FindAll(r => r.Status != null).Count} of {results.Count} listed server(s) answered";
+            _browsing = false;
+        }
+
+        /// <summary>
+        /// Quick join (the simplest matchmaking): ask the listed instances, then join
+        /// the one ServerStatus.PickQuickJoin chooses — compatible, not full, fullest
+        /// first. The same rule as the test client's --quickjoin.
+        /// </summary>
+        private IEnumerator QuickJoin()
+        {
+            yield return BrowseServers();
+            List<ServerStatus> statuses = _browserResults.ConvertAll(entry => entry.Status);
+            int pick = ServerStatus.PickQuickJoin(statuses);
+            if (pick < 0)
+            {
+                _browserStatus = "Quick join: no listed server is compatible and has room";
+                yield break;
+            }
+            BrowserEntry chosen = _browserResults[pick];
+            _browserStatus = $"Quick join: {chosen.Status.ServerName} ({chosen.Status.PlayersOnline}/{chosen.Status.MaxPlayers})";
+            JoinServer(chosen.Host, chosen.Status.GamePort, chosen.Status.HttpPort);
+        }
+
+        /// <summary>Join from a list (a LAN row, a browser row, Quick join): take the
+        /// address and both ports, then connect.</summary>
+        public void JoinServer(string host, int gamePort, int httpPort)
+        {
+            Host = host;
+            Port = gamePort;
+            HttpPort = httpPort;
             Connect();
         }
 
@@ -488,6 +713,16 @@ namespace KnockKnockArena.Networking
                         ServerInfoLine = $"server v{info.ServerVersion} | tick {info.TickRate} Hz | " +
                                          $"{info.PlayersOnline}/{info.MaxPlayers} online | " +
                                          $"map {info.MapName} {ArenaMapData.FormatHash(info.MapHash)}";
+
+                        // Second check on the map, and the one that matters: the config
+                        // came from REST, but THIS is the hash of the geometry the game
+                        // ports are actually simulating against. They can differ if the
+                        // server was pointed at a new map between the two calls.
+                        if (_serverMapHash.HasValue && _serverMapHash.Value != info.MapHash)
+                            Disconnect(
+                                $"Map changed mid-connect: /api/config served " +
+                                $"{ArenaMapData.FormatHash(_serverMapHash.Value)} but the game server is " +
+                                $"running {ArenaMapData.FormatHash(info.MapHash)}. Reconnect.");
                         break;
 
                     case ChatBroadcast chat:
@@ -523,6 +758,8 @@ namespace KnockKnockArena.Networking
                         break;
 
                     case RocketExploded exploded:
+                        // Effects play on EVENTS; the snapshot only despawns the
+                        // rocket entity.
                         HandleRocketExploded(exploded);
                         break;
 

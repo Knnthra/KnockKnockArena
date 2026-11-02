@@ -10,20 +10,27 @@ namespace KnockKnockArena.Server.Game;
 /// client reads its own copy (Assets/Arena/arena.json) with the same parser — the two
 /// sides agree only because the two files happen to be the same. Module 8: the weapon
 /// table (data/weapons.json), with the same shared JSON code - the client has its own
-/// copy too. Fetching both from the server comes in M10. Module 9: the pickup table
+/// copy too. Module 10: the raw text of both files is kept for GET /api/config - the
+/// client fetches these exact bytes and parses them with the SAME shared loader, so
+/// the two sides can no longer disagree. Module 9: the pickup table
 /// (data/pickups.json, the pickup radius per type) - server-only, the client never
 /// predicts pickups.
 /// </summary>
 public sealed class GameContent
 {
     public ArenaMapData Map { get; }
+    public string MapJson { get; }
     public string MapPath { get; }
+    public string WeaponsJson { get; }
     public string WeaponsPath { get; }
 
-    private GameContent(ArenaMapData map, string mapPath, string weaponsPath)
+    private GameContent(ArenaMapData map, string mapJson, string mapPath,
+        string weaponsJson, string weaponsPath)
     {
         Map = map;
+        MapJson = mapJson;
         MapPath = mapPath;
+        WeaponsJson = weaponsJson;
         WeaponsPath = weaponsPath;
     }
 
@@ -71,7 +78,7 @@ public sealed class GameContent
         Log.Info($"Weapon table loaded from {weaponsPath}: {weapons.Length} weapons");
         Log.Info($"Pickup radii: {pickups.Describe()}");
 
-        return new GameContent(map, mapPath, weaponsPath);
+        return new GameContent(map, mapJson, mapPath, weaponsJson, weaponsPath);
     }
 
     /// <summary>The pickup table is optional — an older data directory without it

@@ -5,13 +5,16 @@ namespace KnockKnockArena.Server;
 /// <summary>
 /// Server configuration, from command-line arguments:
 ///
-///   args: --port N, --max-players N, --name TEXT, --map PATH, --weapons PATH,
-///         --pickups PATH, --verbose
+///   args: --port N, --http-port N, --max-players N, --name TEXT, --map PATH,
+///         --weapons PATH, --pickups PATH, --verbose
 /// </summary>
 public sealed class ServerConfig
 {
     /// <summary>Used for BOTH the TCP listener and the UDP socket (same number, two protocols).</summary>
     public int Port { get; private set; } = 36363;
+
+    /// <summary>The REST API (M10), on its own port: status and config over HTTP.</summary>
+    public int HttpPort { get; private set; } = 8080;
 
     public int MaxPlayers { get; private set; } = 12;
 
@@ -44,6 +47,10 @@ public sealed class ServerConfig
                     config.Port = port;
                     i++;
                     break;
+                case "--http-port" when i + 1 < args.Length && int.TryParse(args[i + 1], out int httpPort):
+                    config.HttpPort = httpPort;
+                    i++;
+                    break;
                 case "--max-players" when i + 1 < args.Length && int.TryParse(args[i + 1], out int max):
                     config.MaxPlayers = max;
                     i++;
@@ -69,12 +76,14 @@ public sealed class ServerConfig
                     break;
                 default:
                     throw new ArgumentException($"Unknown argument '{args[i]}'. " +
-                        "Usage: --port N --max-players N --name TEXT --map PATH --weapons PATH --pickups PATH --verbose");
+                        "Usage: --port N --http-port N --max-players N --name TEXT --map PATH --weapons PATH --pickups PATH --verbose");
             }
         }
 
         if (config.Port is < 1024 or > 65535)
             throw new ArgumentException($"Port {config.Port} is out of range (1024-65535).");
+        if (config.HttpPort is < 1024 or > 65535 || config.HttpPort == config.Port)
+            throw new ArgumentException($"HTTP port {config.HttpPort} is out of range or collides with the game port.");
         if (config.MaxPlayers < 1)
             throw new ArgumentException($"Max players {config.MaxPlayers} is out of range (at least 1).");
 

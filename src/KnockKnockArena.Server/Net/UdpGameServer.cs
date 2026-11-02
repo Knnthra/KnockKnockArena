@@ -208,7 +208,7 @@ public sealed class UdpGameServer
         {
             Nonce = request.Nonce,
             GamePort = (ushort)_config.Port,
-            HttpPort = 0,        // no REST API before M10
+            HttpPort = (ushort)_config.HttpPort,
             PlayersOnline = (byte)_sessions.Count,
             MaxPlayers = (byte)_config.MaxPlayers,
             ServerName = _config.ServerName,

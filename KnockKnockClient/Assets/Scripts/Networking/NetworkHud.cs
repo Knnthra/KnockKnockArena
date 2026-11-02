@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using KnockKnockArena.Shared.Protocol;
 using KnockKnockArena.Gameplay;
 using KnockKnockArena.Shared.Protocol.Udp;
 using UnityEngine;
@@ -6,8 +7,11 @@ using UnityEngine;
 namespace KnockKnockArena.Networking
 {
     /// <summary>
-    /// Handed out (Moodle), module 9 after implementation 8: the dev UI — connect panel
-    /// with the latency field, "Find LAN servers" and the list of servers that answered,
+    /// Handed out (Moodle), module 10 after implementation 5: the dev UI — connect panel
+    /// with the HTTP port row (the REST port /api/config is fetched from) and the
+    /// latency field, "Find LAN servers", "Browse", "Quick join" and the Browse list
+    /// row, and one scrollable list with the LAN servers that answered and the server
+    /// browser's rows (Join only for a compatible server),
     /// HUD with your HP, the shown weapon and its ammo, frags and deaths, the UDP
     /// counters (joins, snapshots, snapshots dropped out of order, inputs, heartbeats),
     /// the prediction line (unacked inputs, reconciliations, bitMismatches, the first
@@ -16,10 +20,12 @@ namespace KnockKnockArena.Networking
     /// pickup, the kills, the rocket explosions), the YOU DIED overlay with the
     /// respawn countdown, and the scoreboard while Tab is held. The crosshair, the weapon bar and the status HUD
     /// (health and ammo in the corners) are not drawn here: they are the base
-    /// project's components, fed by NetworkBootstrap. The UI is unchanged since
-    /// implementation 4; it replaces the NetworkHud.cs from implementation 5.
+    /// project's components, fed by NetworkBootstrap. New since implementation 3: the
+    /// Browse and Quick join buttons, the Browse list row and the browser's rows; the
+    /// connect panel is 480 pixels tall and the list 150. It replaces the
+    /// NetworkHud.cs from implementation 3.
     /// It only reads NetworkBootstrap's public properties, sets its
-    /// connect fields, SimulatedLatencyMs, SimulatedJitterMs, EnablePrediction,
+    /// connect fields (HttpPort and ServerBrowserList among them), SimulatedLatencyMs, SimulatedJitterMs, EnablePrediction,
     /// EnableReconciliation, EnableInterpolation and IsTyping, listens
     /// to its two events and calls its public methods; it never touches the network. Put it in Assets/Scripts/Networking next to NetworkBootstrap.
     /// It adds itself to the NetworkBootstrap object when the scene starts, so nothing in
@@ -133,7 +139,7 @@ namespace KnockKnockArena.Networking
         private void DrawConnectPanel()
         {
             // Solid black panel with white text: the default box is see-through.
-            Rect panel = new Rect(20, 20, 400, 390);
+            Rect panel = new Rect(20, 20, 400, 480);
             Color previousColor = GUI.color;
             Color previousContent = GUI.contentColor;
             GUI.color = Color.black;
@@ -150,6 +156,10 @@ namespace KnockKnockArena.Networking
             GUILayout.BeginHorizontal();
             GUILayout.Label("Port", GUILayout.Width(70));
             int.TryParse(GUILayout.TextField(_net.Port.ToString()), out _net.Port);
+            GUILayout.EndHorizontal();
+            GUILayout.BeginHorizontal();
+            GUILayout.Label("HTTP port", GUILayout.Width(70));
+            int.TryParse(GUILayout.TextField(_net.HttpPort.ToString()), out _net.HttpPort);
             GUILayout.EndHorizontal();
             GUILayout.BeginHorizontal();
             GUILayout.Label("User", GUILayout.Width(70));
@@ -171,7 +181,16 @@ namespace KnockKnockArena.Networking
             GUI.enabled = !_net.IsConnecting && !_net.IsSearchingLan;
             if (GUILayout.Button("Find LAN servers"))
                 _net.FindLanServers();
+            GUI.enabled = !_net.IsConnecting && !_net.IsBrowsing;
+            if (GUILayout.Button("Browse"))
+                _net.StartBrowse();
+            if (GUILayout.Button("Quick join"))
+                _net.StartQuickJoin();
             GUI.enabled = true;
+            GUILayout.EndHorizontal();
+            GUILayout.BeginHorizontal();
+            GUILayout.Label("Browse list", GUILayout.Width(70));
+            _net.ServerBrowserList = GUILayout.TextField(_net.ServerBrowserList);
             GUILayout.EndHorizontal();
             DrawServerList();
 
@@ -182,11 +201,12 @@ namespace KnockKnockArena.Networking
 
         private void DrawServerList()
         {
-            if (_net.LanStatus.Length == 0)
+            if (_net.LanStatus.Length == 0 && _net.BrowserStatus.Length == 0)
                 return;
 
-            _serverListScroll = GUILayout.BeginScrollView(_serverListScroll, GUILayout.Height(120));
-            GUILayout.Label(_net.LanStatus);
+            _serverListScroll = GUILayout.BeginScrollView(_serverListScroll, GUILayout.Height(150));
+            if (_net.LanStatus.Length > 0)
+                GUILayout.Label(_net.LanStatus);
             foreach (DiscoveredServer server in _net.LanServers)
             {
                 GUILayout.BeginHorizontal();
@@ -198,13 +218,43 @@ namespace KnockKnockArena.Networking
                 {
                     GUILayout.Label($"{server.Info.ServerName}  {server.Info.PlayersOnline}/{server.Info.MaxPlayers}");
                     GUI.enabled = !_net.IsConnecting;
+                    // The discovery answer carries the REST port too: the config
+                    // lookup needs it before the game port is touched.
                     if (GUILayout.Button("Join", GUILayout.Width(50)))
-                        _net.JoinLanServer(server);
+                        _net.JoinServer(server.Address.ToString(), server.Info.GamePort, server.Info.HttpPort);
                     GUI.enabled = true;
                 }
                 GUILayout.EndHorizontal();
             }
+            DrawBrowserRows();
             GUILayout.EndScrollView();
+        }
+
+        /// <summary>The browser's rows in the server list: one per listed entry, with
+        /// Join only for a server that speaks our protocol version.</summary>
+        private void DrawBrowserRows()
+        {
+            if (_net.BrowserStatus.Length > 0)
+                GUILayout.Label(_net.BrowserStatus);
+            foreach (NetworkBootstrap.BrowserEntry entry in _net.BrowserResults)
+            {
+                GUILayout.BeginHorizontal();
+                if (entry.Status == null)
+                {
+                    GUILayout.Label($"{entry.Label}: {entry.Error}");
+                }
+                else
+                {
+                    ServerStatus status = entry.Status;
+                    GUILayout.Label($"{status.ServerName}  {status.PlayersOnline}/{status.MaxPlayers}  \"{status.MapName}\"" +
+                                    (status.Compatible ? "" : $"  v{status.ProtocolVersion} (incompatible)"));
+                    GUI.enabled = !_net.IsConnecting && status.Compatible;
+                    if (GUILayout.Button("Join", GUILayout.Width(50)))
+                        _net.JoinServer(entry.Host, status.GamePort, status.HttpPort);
+                    GUI.enabled = true;
+                }
+                GUILayout.EndHorizontal();
+            }
         }
 
         // The counters change every frame. In a font where every character is equally wide, and with a fixed width

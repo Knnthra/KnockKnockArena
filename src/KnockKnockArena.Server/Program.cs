@@ -25,15 +25,16 @@ Log.VerboseEnabled = config.Verbose;
 
 Log.Info($"KnockKnock Arena server v{TcpGameServer.ServerVersion} " +
          $"(protocol v{KnockKnockArena.Shared.Protocol.ProtocolConstants.Version})");
-Log.Info($"name=\"{config.ServerName}\" port={config.Port} maxPlayers={config.MaxPlayers} " +
+Log.Info($"name=\"{config.ServerName}\" port={config.Port} httpPort={config.HttpPort} maxPlayers={config.MaxPlayers} " +
          $"verbose={(config.Verbose ? "on" : "off")}");
 
 // The arena is DATA, loaded before anything can simulate. The loader lives in the
 // shared code, so the client that reads its own copy of the file turns it into the
 // same floats and can predict against them.
+GameContent content;
 try
 {
-    GameContent.Load(config);
+    content = GameContent.Load(config);
 }
 catch (Exception ex)
 {
@@ -67,6 +68,23 @@ udpServer.PlayerDamaged = hit =>
 
 server.Start();
 udpServer.Start();
+// The REST API (M10): what the server browser asks (status), and what a client
+// fetches before it joins (config).
+RestApi.Start(config, content, () => new
+{
+    serverName = config.ServerName,
+    version = TcpGameServer.ServerVersion,
+    protocolVersion = KnockKnockArena.Shared.Protocol.ProtocolConstants.Version,
+    uptimeSeconds = (long)server.Uptime.TotalSeconds,
+    playersOnline = server.PlayersOnline,
+    playersInGame = world.PlayerCount,
+    maxPlayers = config.MaxPlayers,
+    gamePort = config.Port,
+    httpPort = config.HttpPort,
+    tickRate = KnockKnockArena.Shared.Simulation.GameConstants.TickRate,
+    mapName = content.Map.Name,
+    mapHash = KnockKnockArena.Shared.Simulation.ArenaMapData.FormatHash(content.Map.Hash),
+});
 
 using ManualResetEventSlim shutdown = new();
 Console.CancelKeyPress += (_, e) =>

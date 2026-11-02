@@ -37,7 +37,7 @@
       "cooldownSeconds": 0.35,
       "priority": 1,
       "baseSpreadDeg": 1.0,
-      "spreadPerShotDeg": 0.8,
+      "spreadPerShotDeg": 4.0,
       "maxSpreadDeg": 4.0,
       "spreadRecoveryDegPerSec": 6.0
     },
