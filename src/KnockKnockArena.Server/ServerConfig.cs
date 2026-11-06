@@ -6,7 +6,7 @@ namespace KnockKnockArena.Server;
 /// Server configuration, from command-line arguments:
 ///
 ///   args: --port N, --http-port N, --max-players N, --name TEXT, --map PATH,
-///         --weapons PATH, --pickups PATH, --verbose
+///         --weapons PATH, --pickups PATH, --data-dir PATH, --verbose, --dev-accounts
 /// </summary>
 public sealed class ServerConfig
 {
@@ -33,7 +33,15 @@ public sealed class ServerConfig
     /// it every pickup keeps the default radius.</summary>
     public string PickupsPath { get; private set; } = "data/pickups.json";
 
+    /// <summary>Where the accounts live (M11): DataDir/accounts.json - password hashes
+    /// and salts, never the passwords. Created on first start; never commit it.</summary>
+    public string DataDir { get; private set; } = "data";
+
     public bool Verbose { get; private set; }
+
+    /// <summary>Seed a NEW accounts.json with alice, bob and test/test (M11) - a local
+    /// development server only: on a shared server everyone could log in as test.</summary>
+    public bool DevAccounts { get; private set; }
 
     public static ServerConfig Load(string[] args)
     {
@@ -71,12 +79,19 @@ public sealed class ServerConfig
                     config.PickupsPath = args[i + 1];
                     i++;
                     break;
+                case "--data-dir" when i + 1 < args.Length:
+                    config.DataDir = args[i + 1];
+                    i++;
+                    break;
                 case "--verbose":
                     config.Verbose = true;
                     break;
+                case "--dev-accounts":
+                    config.DevAccounts = true;
+                    break;
                 default:
                     throw new ArgumentException($"Unknown argument '{args[i]}'. " +
-                        "Usage: --port N --http-port N --max-players N --name TEXT --map PATH --weapons PATH --pickups PATH --verbose");
+                        "Usage: --port N --http-port N --max-players N --name TEXT --map PATH --weapons PATH --pickups PATH --data-dir PATH --verbose --dev-accounts");
             }
         }
 

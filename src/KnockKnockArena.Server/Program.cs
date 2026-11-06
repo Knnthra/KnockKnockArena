@@ -26,6 +26,7 @@ Log.VerboseEnabled = config.Verbose;
 Log.Info($"KnockKnock Arena server v{TcpGameServer.ServerVersion} " +
          $"(protocol v{KnockKnockArena.Shared.Protocol.ProtocolConstants.Version})");
 Log.Info($"name=\"{config.ServerName}\" port={config.Port} httpPort={config.HttpPort} maxPlayers={config.MaxPlayers} " +
+         $"dataDir={config.DataDir} " +
          $"verbose={(config.Verbose ? "on" : "off")}");
 
 // The arena is DATA, loaded before anything can simulate. The loader lives in the
@@ -43,16 +44,22 @@ catch (Exception ex)
 }
 
 SessionManager sessions = new(config.MaxPlayers);
+// Accounts (M11): DataDir/accounts.json holds the PBKDF2 hashes and salts.
+AccountStore accounts = new(config.DataDir, config.DevAccounts);
 GameWorld world = new();
 
-TcpGameServer server = new(config, sessions);
+TcpGameServer server = new(config, sessions, accounts);
 UdpGameServer udpServer = new(config, sessions, world);
 
-// TCP disconnect (or kick) -> remove the player from the game world.
+// TCP disconnect (or kick) -> remove the player from the game world, and put the
+// session's score on the account (M11).
 server.PlayerDisconnected += session =>
 {
-    if (world.TryDespawn(session.PlayerId))
+    if (world.TryDespawn(session.PlayerId, out ushort frags, out ushort deaths))
+    {
         Log.Info($"Despawned {session.Username}#{session.PlayerId} from game world");
+        accounts.AccumulateStats(session.Username, frags, deaths);
+    }
 };
 // UDP silence -> full disconnect (S01: timeout gives a TCP event + despawn).
 udpServer.KickPlayer = server.KickByPlayerId;
@@ -70,7 +77,7 @@ server.Start();
 udpServer.Start();
 // The REST API (M10): what the server browser asks (status), and what a client
 // fetches before it joins (config).
-RestApi.Start(config, content, () => new
+RestApi.Start(config, accounts, content, () => new
 {
     serverName = config.ServerName,
     version = TcpGameServer.ServerVersion,

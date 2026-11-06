@@ -125,14 +125,22 @@ public sealed class GameWorld
         }
     }
 
-    /// <summary>Removes a player from the world.</summary>
-    public bool TryDespawn(byte playerId)
+    /// <summary>Removes a player from the world. The session's frags/deaths are
+    /// returned so the caller can accumulate them onto the account (S01 6.4:
+    /// accumulation happens at session end).</summary>
+    public bool TryDespawn(byte playerId, out ushort sessionFrags, out ushort sessionDeaths)
     {
         lock (_gate)
         {
             if (!_playersById.Remove(playerId, out PlayerState? player))
+            {
+                sessionFrags = 0;
+                sessionDeaths = 0;
                 return false;
+            }
             _playersByEndPoint.TryRemove(player.EndPoint, out _);
+            sessionFrags = player.Frags;
+            sessionDeaths = player.Deaths;
             return true;
         }
     }
@@ -980,7 +988,9 @@ public sealed class GameWorld
 
                 // A timed-out player is reported ONCE and left in the world: the caller
                 // kicks the TCP connection, and the ordinary disconnect path despawns
-                // the player.
+                // the player AND puts the session's frags/deaths on the account.
+                // Removing them here instead left nothing for that path to find, so a
+                // timeout would silently lose the session's score.
                 double silentSeconds = (now - player.LastUdpPacketUtc).TotalSeconds;
                 if (!player.TimedOut && silentSeconds > GameConstants.UdpTimeoutSeconds)
                 {

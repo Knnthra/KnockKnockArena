@@ -40,6 +40,16 @@ namespace KnockKnockArena.Networking
     /// The server browser asks each listed server for GET /api/status, and Quick join
     /// picks the fullest compatible server that still has room.
     ///
+    /// MODULE 11: security and accounts. "Any name + password test" is gone: the
+    /// server only lets in accounts it knows. Create account posts the name and
+    /// password in the panel to POST /api/accounts before the first login, and the
+    /// server stores a salted hash. The password travels in clear text — over HTTP
+    /// here and in the TCP LoginRequest — on purpose in this course: it is the
+    /// argument for TLS, not an oversight.
+    /// The leaderboard is GET /api/leaderboard: the score lives on the account, is
+    /// added at disconnect, and so spans every session (the HUD shows it while L is
+    /// held).
+    ///
     /// The dev UI is NetworkHud (handed out): it only reads the public properties
     /// below, listens to the two events and calls the public methods. Nothing here
     /// draws IMGUI; the crosshair, the weapon bar and the status HUD are the base
@@ -447,6 +457,126 @@ namespace KnockKnockArena.Networking
                 return false;
             }
         }
+
+        // ------------------------------------------------------------- account (REST)
+
+        private bool _creatingAccount;
+        private string _accountStatus = "";
+
+        // What the HUD shows of the account. Only this class sets them.
+        public bool IsCreatingAccount => _creatingAccount;
+        public string AccountStatus => _accountStatus;
+
+        [Serializable] private sealed class AccountRequestDto { public string username; public string password; }
+        [Serializable] private sealed class ErrorDto { public string error; }
+
+        /// <summary>Create account (the HUD's button): runs <see cref="CreateAccount"/>
+        /// as a coroutine, so the panel keeps drawing while the server answers.</summary>
+        public void StartCreateAccount()
+        {
+            StartCoroutine(CreateAccount());
+        }
+
+        /// <summary>
+        /// POST /api/accounts with the name and password typed in the panel — the
+        /// first link of the chain REST account → TCP login → UDP join. The password
+        /// travels as typed and is hashed with salt on the SERVER (hashing on the
+        /// client would just make the hash the password). The server answers 201, or
+        /// 400/409 with {"error": ...}, shown as it came.
+        /// </summary>
+        private IEnumerator CreateAccount()
+        {
+            _creatingAccount = true;
+            _accountStatus = $"Creating account '{Username}'...";
+
+            string body = JsonUtility.ToJson(new AccountRequestDto { username = Username, password = Password });
+            string url = $"http://{Host}:{HttpPort}/api/accounts";
+            using (UnityEngine.Networking.UnityWebRequest request =
+                   new UnityEngine.Networking.UnityWebRequest(url, "POST"))
+            {
+                request.uploadHandler = new UnityEngine.Networking.UploadHandlerRaw(System.Text.Encoding.UTF8.GetBytes(body));
+                request.downloadHandler = new UnityEngine.Networking.DownloadHandlerBuffer();
+                request.SetRequestHeader("Content-Type", "application/json");
+                request.timeout = RestTimeoutSeconds;
+                yield return request.SendWebRequest();
+
+                if (request.responseCode == 201)
+                {
+                    _accountStatus = $"Account '{Username}' created — press Connect.";
+                }
+                else if (request.responseCode == 400 || request.responseCode == 409)
+                {
+                    ErrorDto error = null;
+                    try { error = JsonUtility.FromJson<ErrorDto>(request.downloadHandler.text); }
+                    catch (ArgumentException) { }
+                    _accountStatus = $"Not created: {(error != null && !string.IsNullOrEmpty(error.error) ? error.error : request.downloadHandler.text)}";
+                }
+                else
+                {
+                    _accountStatus = $"Could not reach {url}: {request.error}";
+                }
+            }
+            _creatingAccount = false;
+        }
+
+        // ------------------------------------------------------------- leaderboard (REST)
+
+        private LeaderboardEntry[] _leaderboardEntries = new LeaderboardEntry[0];
+        private string _leaderboardStatus = "";
+
+        // What the HUD shows of the leaderboard. Only this class sets them.
+        public IReadOnlyList<LeaderboardEntry> LeaderboardEntries => _leaderboardEntries;
+        public string LeaderboardStatus => _leaderboardStatus;
+
+        /// <summary>One row of GET /api/leaderboard. The field names are the JSON
+        /// keys, because JsonUtility maps by name.</summary>
+        [Serializable]
+        public sealed class LeaderboardEntry
+        {
+            public string username;
+            public long frags;
+            public long deaths;
+            public double kd;
+        }
+
+        [Serializable]
+        private sealed class LeaderboardWrapper
+        {
+            public LeaderboardEntry[] items;
+        }
+
+        /// <summary>Fetch the leaderboard (the HUD calls it once per press of L): runs
+        /// <see cref="FetchLeaderboard"/> as a coroutine.</summary>
+        public void StartFetchLeaderboard()
+        {
+            StartCoroutine(FetchLeaderboard());
+        }
+
+        /// <summary>GET /api/leaderboard — the score on the account, across every
+        /// session, already sorted by K/D on the server. JsonUtility cannot parse a
+        /// top-level array, hence the wrapper trick.</summary>
+        private IEnumerator FetchLeaderboard()
+        {
+            _leaderboardStatus = "fetching...";
+            using (UnityEngine.Networking.UnityWebRequest request =
+                   UnityEngine.Networking.UnityWebRequest.Get($"http://{Host}:{HttpPort}/api/leaderboard"))
+            {
+                request.timeout = RestTimeoutSeconds;
+                yield return request.SendWebRequest();
+                if (request.result != UnityEngine.Networking.UnityWebRequest.Result.Success)
+                {
+                    _leaderboardStatus = $"error: {request.error}";
+                    yield break;
+                }
+
+                LeaderboardWrapper wrapper =
+                    JsonUtility.FromJson<LeaderboardWrapper>("{\"items\":" + request.downloadHandler.text + "}");
+                _leaderboardEntries = wrapper.items ?? new LeaderboardEntry[0];
+                _leaderboardStatus = $"{_leaderboardEntries.Length} accounts (all sessions)";
+            }
+        }
+
+        // ------------------------------------------------------------- disconnect
 
         public void Disconnect(string reason)
         {

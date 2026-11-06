@@ -7,10 +7,10 @@ using UnityEngine;
 namespace KnockKnockArena.Networking
 {
     /// <summary>
-    /// Handed out (Moodle), module 10 after implementation 5: the dev UI — connect panel
+    /// Handed out (Moodle), module 11 after implementation 3: the dev UI — connect panel
     /// with the HTTP port row (the REST port /api/config is fetched from) and the
-    /// latency field, "Find LAN servers", "Browse", "Quick join" and the Browse list
-    /// row, and one scrollable list with the LAN servers that answered and the server
+    /// latency field, "Connect" and "Create account", "Find LAN servers", "Browse",
+    /// "Quick join" and the Browse list row, the account line, and one scrollable list with the LAN servers that answered and the server
     /// browser's rows (Join only for a compatible server),
     /// HUD with your HP, the shown weapon and its ammo, frags and deaths, the UDP
     /// counters (joins, snapshots, snapshots dropped out of order, inputs, heartbeats),
@@ -18,12 +18,15 @@ namespace KnockKnockArena.Networking
     /// mismatch), the key line (the prediction, reconciliation and interpolation toggles and the
     /// latency and jitter sliders are in the settings menu, F1), chat and the feed (joined, left, took a
     /// pickup, the kills, the rocket explosions), the YOU DIED overlay with the
-    /// respawn countdown, and the scoreboard while Tab is held. The crosshair, the weapon bar and the status HUD
+    /// respawn countdown, the scoreboard while Tab is held, and the leaderboard while L
+    /// is held. The crosshair, the weapon bar and the status HUD
     /// (health and ammo in the corners) are not drawn here: they are the base
-    /// project's components, fed by NetworkBootstrap. New since implementation 3: the
-    /// Browse and Quick join buttons, the Browse list row and the browser's rows; the
-    /// connect panel is 480 pixels tall and the list 150. It replaces the
-    /// NetworkHud.cs from implementation 3.
+    /// project's components, fed by NetworkBootstrap. New in module 11: the
+    /// Create account button (on its own row with Connect), the account line under
+    /// the server list, the leaderboard box, "L leaderboard" in the key line, and the
+    /// L key that fetches the leaderboard once per press; the connect panel is 535
+    /// pixels tall and the HUD block 860 wide. It replaces the NetworkHud.cs from
+    /// module 10, implementation 5.
     /// It only reads NetworkBootstrap's public properties, sets its
     /// connect fields (HttpPort and ServerBrowserList among them), SimulatedLatencyMs, SimulatedJitterMs, EnablePrediction,
     /// EnableReconciliation, EnableInterpolation and IsTyping, listens
@@ -80,6 +83,10 @@ namespace KnockKnockArena.Networking
             // moving the player, and a click on a slider in the menu is not a shot.
             _net.IsTyping = _chatOpen || GameMenu.Open;
 
+            // Leaderboard: fetched once per press, shown while L is held.
+            if (!_net.IsTyping && _net.InGame && Input.GetKeyDown(KeyCode.L))
+                _net.StartFetchLeaderboard();
+
             // A dropped connection closes the chat line.
             if (!_net.IsLoggedIn && _chatOpen)
             {
@@ -134,12 +141,14 @@ namespace KnockKnockArena.Networking
             DrawFeed();
             if (Input.GetKey(KeyCode.Tab) && _net.InGame)
                 DrawScoreboard();
+            if (!_net.IsTyping && _net.InGame && Input.GetKey(KeyCode.L))
+                DrawLeaderboard();
         }
 
         private void DrawConnectPanel()
         {
             // Solid black panel with white text: the default box is see-through.
-            Rect panel = new Rect(20, 20, 400, 480);
+            Rect panel = new Rect(20, 20, 400, 535);
             Color previousColor = GUI.color;
             Color previousContent = GUI.contentColor;
             GUI.color = Color.black;
@@ -175,9 +184,16 @@ namespace KnockKnockArena.Networking
             GUILayout.EndHorizontal();
 
             GUILayout.BeginHorizontal();
-            GUI.enabled = !_net.IsConnecting;
+            GUI.enabled = !_net.IsConnecting && !_net.IsCreatingAccount;
             if (GUILayout.Button("Connect"))
                 _net.Connect();
+            if (GUILayout.Button("Create account"))
+                _net.StartCreateAccount();
+            GUI.enabled = true;
+            GUILayout.EndHorizontal();
+
+            GUILayout.Space(6);
+            GUILayout.BeginHorizontal();
             GUI.enabled = !_net.IsConnecting && !_net.IsSearchingLan;
             if (GUILayout.Button("Find LAN servers"))
                 _net.FindLanServers();
@@ -194,6 +210,8 @@ namespace KnockKnockArena.Networking
             GUILayout.EndHorizontal();
             DrawServerList();
 
+            if (_net.AccountStatus.Length > 0)
+                GUILayout.Label(_net.AccountStatus);
             GUILayout.Label(_net.StatusLine);
             GUILayout.EndArea();
             GUI.contentColor = previousContent;
@@ -267,7 +285,7 @@ namespace KnockKnockArena.Networking
 
         private void DrawHud()
         {
-            GUILayout.BeginArea(new Rect(20, 20, 780, 160));
+            GUILayout.BeginArea(new Rect(20, 20, 860, 160));
             GUILayout.BeginVertical(HudPanel);
             GUILayout.Label(!_net.InGame ? _net.StatusLine
                 : !_net.HasOwnState ? "In the game (UDP)"
@@ -279,7 +297,7 @@ namespace KnockKnockArena.Networking
             GUILayout.Label($"{_net.ServerInfoLine}  |  unknown TCP messages skipped: {_net.TcpMessagesSkipped}");
             GUILayout.Label($"prediction: unacked={_net.UnackedInputs,3}  reconciliations={_net.Reconciliations,7}  " +
                             $"bitMismatches={_net.BitMismatches,4}", Counters);
-            GUILayout.Label("F1 settings  |  WASD move  |  Shift sprint  |  Ctrl walk  |  Space dash  |  mouse fire  |  1-4 weapons  |  Enter chat  |  Tab scoreboard");
+            GUILayout.Label("F1 settings  |  WASD move  |  Shift sprint  |  Ctrl walk  |  Space dash  |  mouse fire  |  1-4 weapons  |  Enter chat  |  Tab scoreboard  |  L leaderboard");
             if (_net.FirstMismatch.Length > 0)
                 GUILayout.Label($"FIRST MISMATCH: {_net.FirstMismatch}");
             GUILayout.EndVertical();
@@ -323,7 +341,7 @@ namespace KnockKnockArena.Networking
         {
             GUILayout.BeginArea(new Rect(20, 20, 780, 60));
             GUILayout.BeginHorizontal();
-            GUILayout.Label("F1 settings  |  Tab scoreboard  |  Enter chat", HudPanel);
+            GUILayout.Label("F1 settings  |  Tab scoreboard  |  L leaderboard  |  Enter chat", HudPanel);
             GUILayout.FlexibleSpace();
             GUILayout.EndHorizontal();
             GUILayout.EndArea();
@@ -427,6 +445,35 @@ namespace KnockKnockArena.Networking
                 GUILayout.Label(player.Deaths.ToString(), GUILayout.Width(60));
                 GUILayout.Label(player.State == PlayerLifeState.Dead ? "DEAD" : player.Health.ToString(),
                     GUILayout.Width(80));
+                GUILayout.EndHorizontal();
+            }
+            GUILayout.EndArea();
+        }
+
+        /// <summary>Hold L: the account totals from GET /api/leaderboard — every
+        /// session, not just this one. Frags and deaths of the match in progress are
+        /// not in it yet: the server adds them to the account at disconnect.</summary>
+        private void DrawLeaderboard()
+        {
+            IReadOnlyList<NetworkBootstrap.LeaderboardEntry> entries = _net.LeaderboardEntries;
+            const float width = 420f;
+            float height = 84f + entries.Count * 24f;
+            GUILayout.BeginArea(new Rect((Screen.width - width) / 2f, 80f, width, height), HudPanel);
+            GUILayout.Label("LEADERBOARD (REST, alle sessioner)");
+            GUILayout.Label(_net.LeaderboardStatus);
+            GUILayout.BeginHorizontal();
+            GUILayout.Label("Player", GUILayout.Width(180));
+            GUILayout.Label("Frags", GUILayout.Width(60));
+            GUILayout.Label("Deaths", GUILayout.Width(60));
+            GUILayout.Label("K/D", GUILayout.Width(60));
+            GUILayout.EndHorizontal();
+            foreach (NetworkBootstrap.LeaderboardEntry entry in entries)
+            {
+                GUILayout.BeginHorizontal();
+                GUILayout.Label(entry.username, GUILayout.Width(180));
+                GUILayout.Label(entry.frags.ToString(), GUILayout.Width(60));
+                GUILayout.Label(entry.deaths.ToString(), GUILayout.Width(60));
+                GUILayout.Label(entry.kd.ToString("F2"), GUILayout.Width(60));
                 GUILayout.EndHorizontal();
             }
             GUILayout.EndArea();

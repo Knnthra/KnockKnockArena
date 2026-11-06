@@ -3,20 +3,24 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
+using KnockKnockArena.Server.Auth;
 using KnockKnockArena.Server.Game;
 using KnockKnockArena.Shared.Simulation;
 
 namespace KnockKnockArena.Server.Net;
 
+/// <summary>Request body for POST /api/accounts.</summary>
+public sealed record AccountCreateRequest(string? Username, string? Password);
+
 /// <summary>
-/// The REST side of the server (Module 10): status and config. Runs Kestrel inside
-/// the same headless process, on its own port. JSON in/out (camelCase — the ASP.NET
-/// default), documented on the wiki page "REST API". Accounts and the leaderboard
-/// come in M11.
+/// The REST side of the server: status and config (M10), accounts and the
+/// leaderboard (M11). Runs Kestrel inside the same headless process, on its own port.
+/// JSON in/out (camelCase — the ASP.NET default), documented on the wiki page "REST API".
 /// </summary>
 public static class RestApi
 {
-    public static void Start(ServerConfig config, GameContent content, Func<object> statusProvider)
+    public static void Start(ServerConfig config, AccountStore accounts,
+        GameContent content, Func<object> statusProvider)
     {
         WebApplicationBuilder builder = WebApplication.CreateBuilder();
         builder.Logging.ClearProviders(); // our own Log class owns the console
@@ -31,6 +35,24 @@ public static class RestApi
             Log.Packet($"REST {context.Request.Method} {context.Request.Path} " +
                        $"-> {context.Response.StatusCode}");
         });
+
+        app.MapPost("/api/accounts", (AccountCreateRequest request) =>
+        {
+            string username = request.Username ?? "";
+            string password = request.Password ?? "";
+            if (!accounts.TryCreate(username, password, out string error))
+            {
+                int status = error == "username already taken" ? StatusCodes.Status409Conflict
+                                                               : StatusCodes.Status400BadRequest;
+                Log.Warn($"REJECT account creation '{username}': {error}");
+                return Results.Json(new { error }, statusCode: status);
+            }
+
+            Log.Info($"Account created: {username}");
+            return Results.Created($"/api/accounts/{username}", new { username });
+        });
+
+        app.MapGet("/api/leaderboard", () => Results.Json(accounts.GetLeaderboard(50)));
 
         app.MapGet("/api/status", () => Results.Json(statusProvider()));
 
@@ -52,12 +74,11 @@ public static class RestApi
             arena = content.MapJson,
             weapons = content.WeaponsJson,
         }));
-        
 
         // The same two documents on their own, for reading by eye or with curl.
         app.MapGet("/api/config/arena", () => Results.Text(content.MapJson, "application/json"));
         app.MapGet("/api/config/weapons", () => Results.Text(content.WeaponsJson, "application/json"));
-        
+
         // Wait until Kestrel has the port: a port that is taken stops the server with an
         // error, like the TCP listener and the UDP socket do - not a "listening" line for
         // a port someone else answers on.

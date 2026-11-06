@@ -7,6 +7,7 @@
     <Project Path="KnockKnockClient/KnockKnockArena.Shared.csproj" />
   </Folder>
   <Folder Name="/src/">
+    <Project Path="src/KnockKnockArena.Demo.AesEncryption/KnockKnockArena.Demo.AesEncryption.csproj" />
     <Project Path="src/KnockKnockArena.Demo.M01Bits/KnockKnockArena.Demo.M01Bits.csproj" />
     <Project Path="src/KnockKnockArena.Demo.M02Serialization/KnockKnockArena.Demo.M02Serialization.csproj" />
     <Project Path="src/KnockKnockArena.Demo.M03Sockets/KnockKnockArena.Demo.M03Sockets.csproj" />

@@ -20,6 +20,7 @@ public sealed class TcpGameServer
 
     private readonly ServerConfig _config;
     private readonly SessionManager _sessions;
+    private readonly AccountStore _accounts;
     private readonly List<ClientConnection> _clients = new();
     private readonly object _clientsGate = new();
     private readonly DateTime _startedUtc = DateTime.UtcNow;
@@ -30,10 +31,11 @@ public sealed class TcpGameServer
     /// wired up to despawn the player from the game world.</summary>
     public event Action<PlayerSession>? PlayerDisconnected;
 
-    public TcpGameServer(ServerConfig config, SessionManager sessions)
+    public TcpGameServer(ServerConfig config, SessionManager sessions, AccountStore accounts)
     {
         _config = config;
         _sessions = sessions;
+        _accounts = accounts;
     }
 
     public TimeSpan Uptime => DateTime.UtcNow - _startedUtc;
@@ -142,16 +144,18 @@ public sealed class TcpGameServer
         LoginRequest request = LoginRequest.FromPayload(payload);
 
         string error;
+        string accountUsername = "";
         if (connection.Session != null)
         {
             error = "already logged in";
         }
-        else if (request.Username.Length == 0 || request.Password != "test")
+        else if (!_accounts.Validate(request.Username, request.Password, out accountUsername))
         {
-            // Module 4: any username, one hardcoded password. Real accounts come in M11.
+            // Module 11: the account's PBKDF2 hash decides - an unknown name and a wrong
+            // password get the same answer, so a guess learns nothing about which it was.
             error = "invalid credentials";
         }
-        else if (_sessions.TryCreate(request.Username, out PlayerSession? session, out error))
+        else if (_sessions.TryCreate(accountUsername, out PlayerSession? session, out error))
         {
             connection.Session = session;
 
